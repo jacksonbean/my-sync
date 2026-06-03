@@ -197,6 +197,7 @@ var preserveMeta bool
 var syncDbService *sync_db.AsyncDbService
 var syncDbJobID string
 var lastSrcMeta object.ObjectMeta // cached from copy paths to avoid Head in record
+var syncSrc object.ObjectStorage  // source storage for Head in recordSyncObject
 
 func incrTotal(n int64) {
 	totalHandled.Add(n)
@@ -745,6 +746,13 @@ func recordSyncObject(jobID, key string, size int64, startTime time.Time, status
 	}
 	contentType := lastSrcMeta.ContentType
 	meta := lastSrcMeta.Metadata
+	// Fallback: producer-level skip may not have lastSrcMeta cached
+	if contentType == "" && meta == nil && syncSrc != nil {
+		if srcObj, err := syncSrc.Head(ctx, key); err == nil {
+			contentType = srcObj.ContentType()
+			meta = srcObj.Metadata()
+		}
+	}
 	var metaJSON string
 	if len(meta) > 0 {
 		if b, e := json.Marshal(meta); e == nil {
@@ -1159,6 +1167,9 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 				failed.Increment()
 				taskErr = err
 				break
+					if syncDbService != nil {
+						recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusFailed, err.Error())
+					}
 			} else if equal {
 				if config.DeleteSrc {
 					if obj.IsDir() {
@@ -1177,14 +1188,23 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 							skipped.Increment()
 							skippedBytes.IncrInt64(obj.Size())
 						}
+						if syncDbService != nil {
+							recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusSkipped, "")
+						}
 					} else {
 						logger.Warnf("Failed to head object %s: %s", key, e)
 						failed.Increment()
 						taskErr = e
+						if syncDbService != nil {
+							recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusFailed, e.Error())
+						}
 					}
 				} else {
 					skipped.Increment()
 					skippedBytes.IncrInt64(obj.Size())
+				}
+				if syncDbService != nil {
+					recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusSkipped, "")
 				}
 				break
 			}
@@ -1472,6 +1492,9 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 		}
 		skip++
 		skipBytes += obj.Size()
+			if syncDbService != nil {
+				recordSyncObject(syncDbJobID, obj.Key(), obj.Size(), time.Now(), sync_db.StatusSkipped, "")
+			}
 		if skip > 100 || time.Since(lastUpdate) > time.Millisecond*100 {
 			lastUpdate = time.Now()
 			flushProgress()
@@ -2187,6 +2210,7 @@ func scanOnly(src, dst object.ObjectStorage) error {
 // Sync syncs all the keys between to object storage
 func Sync(src, dst object.ObjectStorage, config *Config) error {
 	preserveMeta = config.PreserveMeta
+	syncSrc = src
 
 	// Initialize db service if configured
 	if config.DbDSN != "" {
@@ -2228,13 +2252,17 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 
 	// Start db job for normal sync
 	if syncDbService != nil {
-		_ = syncDbService.StartJob(sync_db.JobInfo{
+		if err := syncDbService.StartJob(sync_db.JobInfo{
 			ID:        syncDbJobID,
 			SrcURL:    src.String(),
 			DstURL:    dst.String(),
 			StartTime: time.Now(),
 			Status:    sync_db.JobRunning,
-		})
+		}); err != nil {
+			logger.Errorf("Failed to start db job: %v", err)
+		} else {
+			logger.Infof("DB DEBUG: StartJob succeeded")
+		}
 	}
 
 	var checkpointMgr *CheckpointManager

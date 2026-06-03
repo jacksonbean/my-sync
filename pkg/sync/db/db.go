@@ -5,7 +5,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -147,7 +146,6 @@ type AsyncDbService struct {
 	closed  bool
 	mu      sync.Mutex
 	errors  []error
-	dropped int64 // count of records dropped due to channel full
 	batch   []ObjectRecord
 }
 
@@ -203,20 +201,24 @@ func (a *AsyncDbService) flushBatch() {
 	a.batch = a.batch[:0]
 }
 
-// RecordObject sends an object record to the async channel (non-blocking).
-// Drops the record if the channel is full (does NOT block sync).
-func (a *AsyncDbService) RecordObject(rec ObjectRecord) error {
-	a.mu.Lock()
-	if a.closed {
-		a.mu.Unlock()
-		return fmt.Errorf("service closed")
-	}
-	a.mu.Unlock()
+// sendSafe sends to channel, returns false if channel closed or full.
+func sendSafe(ch chan ObjectRecord, rec ObjectRecord) (sent bool) {
+	defer func() { recover() }() // catch panic from send on closed channel
 	select {
-	case a.ch <- rec:
+	case ch <- rec:
+		return true
 	default:
-		n := atomic.AddInt64(&a.dropped, 1)
-		logger.Warnf("DB channel full, dropped record for %s (total dropped: %d)", rec.SourceKey, n)
+		return false
+	}
+}
+
+// RecordObject sends an object record to the async channel (non-blocking).
+// Drops the record if channel is full or closed — DB issues never block migration.
+func (a *AsyncDbService) RecordObject(rec ObjectRecord) error {
+	if !sendSafe(a.ch, rec) {
+		a.mu.Lock()
+		a.errors = append(a.errors, fmt.Errorf("RecordObject dropped: %s", rec.SourceKey))
+		a.mu.Unlock()
 	}
 	return nil
 }
@@ -231,8 +233,11 @@ func (a *AsyncDbService) Close() error {
 	a.mu.Unlock()
 	a.wg.Wait()
 	close(a.done)
-	if n := atomic.LoadInt64(&a.dropped); n > 0 {
-		logger.Warnf("Total db records dropped: %d", n)
+	a.mu.Lock()
+	errCount := len(a.errors)
+	a.mu.Unlock()
+	if errCount > 0 {
+		logger.Warnf("DB write errors during sync: %d (check logs for details)", errCount)
 	}
 	return nil
 }

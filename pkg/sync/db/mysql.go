@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,8 +12,9 @@ import (
 
 // mysqlService implements DbService backed by MySQL.
 type mysqlService struct {
-	db  *sql.DB
-	mu  sync.Mutex
+	db          *sql.DB
+	objectsTable string // per-job table name, set by StartJob
+	mu          sync.Mutex
 }
 
 // NewMySQLService creates a new MySQL-backed DbService.
@@ -31,14 +33,14 @@ func NewMySQLService(dsn string) (DbService, error) {
 	}
 
 	svc := &mysqlService{db: db}
-	if err := svc.createTables(); err != nil {
+	if err := svc.createJobsTable(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return svc, nil
 }
 
-func (s *mysqlService) createTables() error {
+func (s *mysqlService) createJobsTable() error {
 	jobsSQL := `CREATE TABLE IF NOT EXISTS sync_jobs (
 		id VARCHAR(128) PRIMARY KEY,
 		src_url TEXT NOT NULL,
@@ -56,10 +58,15 @@ func (s *mysqlService) createTables() error {
 	if _, err := s.db.Exec(jobsSQL); err != nil {
 		return fmt.Errorf("create sync_jobs: %w", err)
 	}
+	return nil
+}
 
-	objectsSQL := `CREATE TABLE IF NOT EXISTS sync_objects (
+func (s *mysqlService) createObjectsTable(tableName string) error {
+	// Sanitize table name
+	tableName = strings.ReplaceAll(tableName, "-", "_")
+	tableName = strings.ReplaceAll(tableName, ".", "_")
+	sql := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 		id BIGINT AUTO_INCREMENT PRIMARY KEY,
-		job_id VARCHAR(128) NOT NULL,
 		source_key VARCHAR(2048) NOT NULL,
 		target_key VARCHAR(2048),
 		size BIGINT DEFAULT 0,
@@ -69,32 +76,53 @@ func (s *mysqlService) createTables() error {
 		error_msg TEXT,
 		start_time DATETIME(3),
 		end_time DATETIME(3),
-		INDEX idx_job_id (job_id),
 		INDEX idx_status (status)
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-	if _, err := s.db.Exec(objectsSQL); err != nil {
-		return fmt.Errorf("create sync_objects: %w", err)
-	}
-	return nil
-}
-
-func (s *mysqlService) StartJob(job JobInfo) error {
-	jobsSQL := `INSERT INTO sync_jobs
-		(id, src_url, dst_url, start_time, end_time, total_objects, copied_objects, skipped_objects, failed_objects, deleted_objects, total_bytes, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	_, err := s.db.Exec(jobsSQL,
-		job.ID, job.SrcURL, job.DstURL, job.StartTime, job.EndTime,
-		job.TotalObjects, job.CopiedObjects, job.SkippedObjects, job.FailedObjects, job.DeletedObjects, job.TotalBytes,
-		string(job.Status))
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, tableName)
+	_, err := s.db.Exec(sql)
 	return err
 }
 
+func (s *mysqlService) StartJob(job JobInfo) error {
+	// Insert job record
+	jobsSQL := `INSERT INTO sync_jobs
+		(id, src_url, dst_url, start_time, end_time, total_objects, copied_objects, skipped_objects, failed_objects, deleted_objects, total_bytes, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	var endTime interface{}
+	if job.EndTime.IsZero() {
+		endTime = nil
+	} else {
+		endTime = job.EndTime
+	}
+	if _, err := s.db.Exec(jobsSQL,
+		job.ID, job.SrcURL, job.DstURL, job.StartTime, endTime,
+		job.TotalObjects, job.CopiedObjects, job.SkippedObjects, job.FailedObjects, job.DeletedObjects, job.TotalBytes,
+		string(job.Status)); err != nil {
+		return err
+	}
+
+	// Create per-job objects table
+	tableName := "objects_" + strings.ReplaceAll(strings.ReplaceAll(job.ID, "-", "_"), ".", "_")
+	if err := s.createObjectsTable(tableName); err != nil {
+		return fmt.Errorf("create objects table %s: %w", tableName, err)
+	}
+	s.mu.Lock()
+	s.objectsTable = tableName
+	s.mu.Unlock()
+	return nil
+}
+
 func (s *mysqlService) RecordObject(rec ObjectRecord) error {
-	objectsSQL := `INSERT INTO sync_objects
-		(job_id, source_key, target_key, size, content_type, metadata_json, status, error_msg, start_time, end_time)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	s.mu.Lock()
+	table := s.objectsTable
+	s.mu.Unlock()
+	if table == "" {
+		return fmt.Errorf("no active job")
+	}
+	objectsSQL := fmt.Sprintf(`INSERT INTO %s
+		(source_key, target_key, size, content_type, metadata_json, status, error_msg, start_time, end_time)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, table)
 	_, err := s.db.Exec(objectsSQL,
-		rec.JobID, rec.SourceKey, rec.TargetKey, rec.Size,
+		rec.SourceKey, rec.TargetKey, rec.Size,
 		rec.ContentType, rec.Metadata, string(rec.Status), rec.ErrorMsg,
 		rec.StartTime, rec.EndTime)
 	return err
