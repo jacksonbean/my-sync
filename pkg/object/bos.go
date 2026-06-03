@@ -1,0 +1,334 @@
+//go:build !nobos
+// +build !nobos
+
+/*
+ * JuiceFS, Copyright 2018 Juicedata, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package object
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"hash/crc32"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/baidubce/bce-sdk-go/bce"
+	"github.com/baidubce/bce-sdk-go/services/bos"
+	"github.com/baidubce/bce-sdk-go/services/bos/api"
+	"github.com/juicedata/juicefs/pkg/utils"
+)
+
+type bosclient struct {
+	DefaultObjectStorage
+	bucket string
+	c      *bos.Client
+	tierStorage
+}
+
+func (q *bosclient) String() string {
+	return fmt.Sprintf("bos://%s/", q.bucket)
+}
+
+func (q *bosclient) Limits() Limits {
+	return Limits{
+		IsSupportMultipartUpload: true,
+		IsSupportUploadPartCopy:  true,
+		MinPartSize:              100 << 10,
+		MaxPartSize:              5 << 30,
+		MaxPartCount:             10000,
+	}
+}
+
+func (q *bosclient) Create(ctx context.Context) error {
+	_, err := q.c.PutBucket(q.bucket)
+	if err == nil && q.tiers[0].Sc != "" {
+		if err := q.c.PutBucketStorageclass(q.bucket, q.tiers[0].Sc); err != nil {
+			logger.Warnf("failed to set storage class: %v", err)
+		}
+	}
+	if err != nil && isExists(err) {
+		err = nil
+	}
+	return err
+}
+
+func (q *bosclient) Head(ctx context.Context, key string) (Object, error) {
+	r, err := q.c.GetObjectMeta(q.bucket, key)
+	if err != nil {
+		if e, ok := err.(*bce.BceServiceError); ok && e.StatusCode == http.StatusNotFound {
+			err = os.ErrNotExist
+		}
+		return nil, err
+	}
+	mtime, _ := time.Parse(time.RFC1123, r.LastModified)
+	return &objWithMeta{
+		obj: obj{
+			key:    key,
+			size:   r.ContentLength,
+			mtime:  mtime,
+			isDir:  strings.HasSuffix(key, "/"),
+			sc:     r.StorageClass,
+			status: r.BceRestore,
+		},
+		contentType: r.ContentType,
+		metadata:    r.UserMeta,
+	}, nil
+}
+
+func (q *bosclient) Get(ctx context.Context, key string, off, limit int64, getters ...AttrGetter) (resp io.ReadCloser, err error) {
+	var r *api.GetObjectResult
+	var needCheck bool
+	if limit > 0 {
+		r, err = q.c.GetObject(q.bucket, key, nil, off, off+limit-1)
+	} else if off > 0 {
+		r, err = q.c.GetObject(q.bucket, key, nil, off)
+	} else {
+		r, err = q.c.GetObject(q.bucket, key, nil)
+		needCheck = true
+	}
+	if err != nil {
+		return
+	}
+	if needCheck {
+		if r.UserMeta[checksumAlgr] != "" {
+			resp = verifyChecksum(r.Body, r.UserMeta[checksumAlgr], r.ContentLength)
+		} else {
+			resp = verifyChecksum0(r.Body, r.ContentCrc32, r.ContentLength, crc32.IEEETable)
+		}
+	} else {
+		resp = r.Body
+	}
+	attrs := ApplyGetters(getters...)
+	attrs.SetStorageClass(r.StorageClass)
+	return
+}
+
+func (q *bosclient) Put(ctx context.Context, key string, in io.Reader, getters ...AttrGetter) error {
+	return q.put(ctx, key, in, ObjectMeta{}, getters...)
+}
+
+// PutWithMeta puts an object with the given metadata.
+func (q *bosclient) PutWithMeta(ctx context.Context, key string, in io.Reader, meta ObjectMeta, getters ...AttrGetter) error {
+	return q.put(ctx, key, in, meta, getters...)
+}
+
+func (q *bosclient) put(ctx context.Context, key string, in io.Reader, meta ObjectMeta, getters ...AttrGetter) error {
+	b, vlen, err := findLen(in)
+	if err != nil {
+		return err
+	}
+	var data []byte
+	if bf, ok := b.(*bytes.Buffer); ok {
+		data = bf.Bytes()
+	} else {
+		data = utils.Alloc0(int(vlen))
+		defer utils.Free0(data)
+		_, err = io.ReadFull(b, data)
+		if err != nil {
+			return err
+		}
+	}
+	body, err := bce.NewBodyFromBytes(data)
+	if err != nil {
+		return err
+	}
+	args := new(api.PutObjectArgs)
+	sc := q.GetStorageClass(ctx)
+	if sc != "" {
+		args.StorageClass = sc
+	}
+	if meta.ContentType != "" {
+		args.ContentType = meta.ContentType
+	}
+	if meta.Metadata != nil {
+		args.UserMeta = meta.Metadata
+	}
+	_, err = q.c.PutObject(q.bucket, key, body, args)
+	attrs := ApplyGetters(getters...)
+	attrs.SetStorageClass(sc)
+	return err
+}
+
+func (q *bosclient) Restore(ctx context.Context, key string, days int32) error {
+	return q.c.RestoreObject(q.bucket, key, int(days), api.RESTORE_TIER_STANDARD)
+}
+
+func (q *bosclient) Copy(ctx context.Context, dst, src string) error {
+	sc := getOrDefaultScValue(q.GetStorageClass(ctx), api.STORAGE_CLASS_STANDARD)
+	_, err := q.c.CopyObject(q.bucket, dst, q.bucket, src, &api.CopyObjectArgs{ObjectMeta: api.ObjectMeta{StorageClass: sc}})
+	return err
+}
+
+func (q *bosclient) Delete(ctx context.Context, key string, getters ...AttrGetter) error {
+	err := q.c.DeleteObject(q.bucket, key)
+	if err != nil && strings.Contains(err.Error(), "NoSuchKey") {
+		err = nil
+	}
+	return err
+}
+
+func (q *bosclient) List(ctx context.Context, prefix, start, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
+	if limit > 1000 {
+		limit = 1000
+	}
+	limit_ := int(limit)
+	out, err := q.c.SimpleListObjects(q.bucket, prefix, limit_, start, delimiter)
+	if err != nil {
+		return nil, false, "", err
+	}
+	n := len(out.Contents)
+	objs := make([]Object, n)
+	for i := 0; i < n; i++ {
+		k := out.Contents[i]
+		mod, _ := time.Parse("2006-01-02T15:04:05Z", k.LastModified)
+		objs[i] = &obj{k.Key, int64(k.Size), mod, strings.HasSuffix(k.Key, "/"), k.StorageClass, ""}
+	}
+	if delimiter != "" {
+		for _, p := range out.CommonPrefixes {
+			objs = append(objs, &obj{p.Prefix, 0, time.Unix(0, 0), true, "", ""})
+		}
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
+	}
+	return objs, out.IsTruncated, out.NextMarker, nil
+}
+
+func (q *bosclient) CreateMultipartUpload(ctx context.Context, key string) (*MultipartUpload, error) {
+	args := new(api.InitiateMultipartUploadArgs)
+	if q.tiers[0].Sc != "" {
+		args.StorageClass = q.tiers[0].Sc
+	}
+	r, err := q.c.InitiateMultipartUpload(q.bucket, key, "", args)
+	if err != nil {
+		return nil, err
+	}
+	return &MultipartUpload{UploadID: r.UploadId, MinPartSize: 4 << 20, MaxCount: 10000}, nil
+}
+
+func (q *bosclient) UploadPart(ctx context.Context, key string, uploadID string, num int, data []byte) (*Part, error) {
+	body, _ := bce.NewBodyFromBytes(data)
+	etag, err := q.c.BasicUploadPart(q.bucket, key, uploadID, num, body)
+	if err != nil {
+		return nil, err
+	}
+	return &Part{Num: num, Size: len(data), ETag: etag}, nil
+}
+
+func (q *bosclient) UploadPartCopy(ctx context.Context, key string, uploadID string, num int, srcKey string, off, size int64) (*Part, error) {
+	result, err := q.c.UploadPartCopy(q.bucket, key, q.bucket, srcKey, uploadID, num,
+		&api.UploadPartCopyArgs{SourceRange: fmt.Sprintf("bytes=%d-%d", off, off+size-1)})
+
+	if err != nil {
+		return nil, err
+	}
+	return &Part{Num: num, Size: int(size), ETag: result.ETag}, nil
+}
+
+func (q *bosclient) AbortUpload(ctx context.Context, key string, uploadID string) {
+	_ = q.c.AbortMultipartUpload(q.bucket, key, uploadID)
+}
+
+func (q *bosclient) CompleteUpload(ctx context.Context, key string, uploadID string, parts []*Part) error {
+	oparts := make([]api.UploadInfoType, len(parts))
+	for i := range parts {
+		oparts[i] = api.UploadInfoType{
+			PartNumber: parts[i].Num,
+			ETag:       parts[i].ETag,
+		}
+	}
+	ps := api.CompleteMultipartUploadArgs{Parts: oparts}
+	_, err := q.c.CompleteMultipartUploadFromStruct(q.bucket, key, uploadID, &ps)
+	return err
+}
+
+func (q *bosclient) ListUploads(ctx context.Context, marker string) ([]*PendingPart, string, error) {
+	result, err := q.c.ListMultipartUploads(q.bucket, &api.ListMultipartUploadsArgs{
+		MaxUploads: 1000,
+		KeyMarker:  marker,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	parts := make([]*PendingPart, len(result.Uploads))
+	for i, u := range result.Uploads {
+		parts[i] = &PendingPart{u.Key, u.UploadId, time.Time{}}
+	}
+	return parts, result.NextKeyMarker, nil
+}
+
+func autoBOSEndpoint(bucketName, accessKey, secretKey string) (string, error) {
+	region := bce.DEFAULT_REGION
+	if r := os.Getenv("BDCLOUD_DEFAULT_REGION"); r != "" {
+		region = r
+	}
+
+	endpoint := fmt.Sprintf("https://%s.bcebos.com", region)
+	bosCli, err := bos.NewClient(accessKey, secretKey, endpoint)
+	if err != nil {
+		return "", err
+	}
+
+	if location, err := bosCli.GetBucketLocation(bucketName); err != nil {
+		return "", err
+	} else {
+		return fmt.Sprintf("%s.bcebos.com", location), nil
+	}
+}
+
+func newBOS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {
+	if !strings.Contains(endpoint, "://") {
+		endpoint = fmt.Sprintf("https://%s", endpoint)
+	}
+	uri, err := url.ParseRequestURI(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("Invalid endpoint: %v, error: %v", endpoint, err)
+	}
+	hostParts := strings.SplitN(uri.Host, ".", 2)
+	if len(hostParts) != 2 {
+		return nil, fmt.Errorf("Invalid endpoint: %v", endpoint)
+	}
+	bucketName := hostParts[0]
+	if accessKey == "" {
+		accessKey = os.Getenv("BDCLOUD_ACCESS_KEY")
+		secretKey = os.Getenv("BDCLOUD_SECRET_KEY")
+	}
+	endpoint = hostParts[1]
+	if hostParts[1] == "bcebos.com" {
+		if endpoint, err = autoBOSEndpoint(bucketName, accessKey, secretKey); err != nil {
+			return nil, fmt.Errorf("Fail to get location of bucket %q: %s", bucketName, err)
+		}
+	}
+	endpoint = fmt.Sprintf("%s://%s", uri.Scheme, endpoint)
+	logger.Debugf("Use endpoint: %s", endpoint)
+	// endpoint format like https://bj.bcebos.com
+	bosClient, err := bos.NewClient(accessKey, secretKey, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	bosClient.Config.Retry = bce.NewNoRetryPolicy()
+	bosClient.Config.UserAgent = UserAgent
+	return &bosclient{bucket: bucketName, c: bosClient}, nil
+}
+
+func init() {
+	Register("bos", newBOS)
+}

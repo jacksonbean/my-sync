@@ -1,0 +1,451 @@
+//go:build !notikv
+// +build !notikv
+
+/*
+ * JuiceFS, Copyright 2021 Juicedata, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package meta
+
+import (
+	"container/heap"
+	"context"
+	"encoding/binary"
+	"math"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	plog "github.com/pingcap/log"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"github.com/tikv/client-go/v2/config"
+	tikverr "github.com/tikv/client-go/v2/error"
+	"github.com/tikv/client-go/v2/oracle"
+	"github.com/tikv/client-go/v2/tikv"
+	"github.com/tikv/client-go/v2/txnkv"
+	"github.com/tikv/client-go/v2/txnkv/txnutil"
+	pd "github.com/tikv/pd/client"
+	"go.uber.org/zap"
+)
+
+func init() {
+	Register("tikv", newKVMeta)
+	drivers["tikv"] = newTikvClient
+
+}
+
+func newTikvClient(addr string) (tkvClient, error) {
+	var plvl string // TiKV (PingCap) uses uber-zap logging, make it less verbose
+	switch logger.Level {
+	case logrus.TraceLevel:
+		plvl = "debug"
+	case logrus.DebugLevel:
+		plvl = "info"
+	case logrus.InfoLevel, logrus.WarnLevel:
+		plvl = "warn"
+	case logrus.ErrorLevel:
+		plvl = "error"
+	default:
+		plvl = "dpanic"
+	}
+	l, prop, _ := plog.InitLogger(&plog.Config{Level: plvl}, zap.Fields(zap.String("component", "tikv"), zap.Int("pid", os.Getpid())))
+	plog.ReplaceGlobals(l, prop)
+
+	tUrl, err := url.Parse("tikv://" + addr)
+	if err != nil {
+		return nil, err
+	}
+	query := tUrl.Query()
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.Security = config.NewSecurity(
+			query.Get("ca"),
+			query.Get("cert"),
+			query.Get("key"),
+			strings.Split(query.Get("verify-cn"), ","))
+	})
+	interval := time.Hour * 3
+	if dur, err := time.ParseDuration(query.Get("gc-interval")); err == nil {
+		if dur != 0 && dur < time.Hour {
+			logger.Warnf("TiKV gc-interval (%s) is too short, and is reset to 1h", dur)
+			dur = time.Hour
+		}
+		interval = dur
+	}
+	logger.Infof("TiKV gc interval is set to %s", interval)
+
+	client, err := txnkv.NewClient(strings.Split(tUrl.Host, ","))
+	if err != nil {
+		return nil, err
+	}
+
+	if strings.ToLower(query.Get("open-tso-follower-proxy")) == "true" {
+		if err := client.KVStore.GetPDClient().UpdateOption(pd.EnableTSOFollowerProxy, true); err != nil {
+			logger.Warnf("Failed to enable TSO Follower Proxy: %v", err)
+		} else {
+			logger.Infof("Enabling TSO Follower Proxy")
+		}
+	}
+
+	if waitStr := query.Get("max-tso-batch-wait-interval"); waitStr != "" {
+		if waitDur, err := time.ParseDuration(waitStr); err == nil {
+			if err := client.KVStore.GetPDClient().UpdateOption(pd.MaxTSOBatchWaitInterval, waitDur); err != nil {
+				logger.Warnf("Failed to set MaxTSOBatchWaitInterval: %v", err)
+			} else {
+				logger.Infof("Set MaxTSOBatchWaitInterval to %s", waitDur)
+			}
+		} else {
+			logger.Warnf("Failed to parse max-tso-batch-wait-interval (%s): %v", waitStr, err)
+		}
+	}
+
+	prefix := strings.TrimLeft(tUrl.Path, "/")
+	return withPrefix(&tikvClient{client: client.KVStore, gcInterval: interval, changeLogShards: tiKVChangeLogShards()}, append([]byte(prefix), 0xFD)), nil
+}
+
+type tikvTxn struct {
+	*tikv.KVTxn
+}
+
+func (tx *tikvTxn) get(key []byte) []byte {
+	value, err := tx.Get(context.TODO(), key)
+	if tikverr.IsErrNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		panic(err)
+	}
+	return value
+}
+
+func (tx *tikvTxn) gets(keys ...[]byte) [][]byte {
+	ret, err := tx.BatchGet(context.TODO(), keys)
+	if err != nil {
+		panic(err)
+	}
+	values := make([][]byte, len(keys))
+	for i, key := range keys {
+		values[i] = ret[string(key)]
+	}
+	return values
+}
+
+func (tx *tikvTxn) scan(begin, end []byte, keysOnly bool, handler func(k, v []byte) bool) {
+	it := tx.iter(begin, end, keysOnly)
+	defer it.Close()
+	for it.Valid() && handler(it.Key(), it.Value()) {
+		if err := it.Next(); err != nil {
+			panic(err)
+		}
+	}
+}
+
+func (tx *tikvTxn) iter(begin, end []byte, keysOnly bool) kvIterator {
+	snap := tx.GetSnapshot()
+	snap.SetScanBatchSize(10240)
+	snap.SetNotFillCache(true)
+	snap.SetKeyOnly(keysOnly)
+	it, err := tx.Iter(begin, end)
+	if err != nil {
+		panic(err)
+	}
+	return it
+}
+
+func (tx *tikvTxn) exist(prefix []byte) bool {
+	it, err := tx.Iter(prefix, nextKey(prefix))
+	if err != nil {
+		panic(err)
+	}
+	defer it.Close()
+	return it.Valid()
+}
+
+func (tx *tikvTxn) set(key, value []byte) {
+	if err := tx.Set(key, value); err != nil {
+		panic(err)
+	}
+}
+
+func (tx *tikvTxn) append(key []byte, value []byte) {
+	new := append(tx.get(key), value...)
+	tx.set(key, new)
+}
+
+func (tx *tikvTxn) incrBy(key []byte, value int64) int64 {
+	buf := tx.get(key)
+	new := parseCounter(buf)
+	if value != 0 {
+		new += value
+		tx.set(key, packCounter(new))
+	}
+	return new
+}
+
+func (tx *tikvTxn) delete(key []byte) {
+	if err := tx.Delete(key); err != nil {
+		panic(err)
+	}
+}
+
+func (tx *tikvTxn) id() uint64 {
+	// StartTS is in milliseconds, and the last 18 bits are for logical time,
+	// so we can use it directly as version
+	return tx.StartTS()
+}
+
+const defaultTiKVChangeLogShards = 64
+
+func tiKVChangeLogShards() int {
+	const envName = "JFS_TKV_CHANGELOG_SHARDS"
+	s := os.Getenv(envName)
+	if s == "" {
+		return defaultTiKVChangeLogShards
+	}
+	shards, err := strconv.Atoi(s)
+	if err != nil || shards <= 0 || shards > 256 {
+		logger.Warnf("invalid %s: %s, use %d", envName, s, defaultTiKVChangeLogShards)
+		return defaultTiKVChangeLogShards
+	}
+	return shards
+}
+
+func (c *tikvClient) logKey(m *kvMeta, id uint64) []byte {
+	shard := byte((id ^ (id >> 18)) % uint64(c.changeLogShards))
+	return m.fmtKey("XLOG", shard, id)
+}
+
+func parseTiKVLogID(key []byte) uint64 {
+	return binary.BigEndian.Uint64(key[5:])
+}
+
+type logMergeItem struct {
+	id    uint64
+	shard int
+}
+
+type logMergeHeap struct {
+	items []logMergeItem
+}
+
+func (h *logMergeHeap) Len() int           { return len(h.items) }
+func (h *logMergeHeap) Less(i, j int) bool { return h.items[i].id < h.items[j].id }
+func (h *logMergeHeap) Swap(i, j int)      { h.items[i], h.items[j] = h.items[j], h.items[i] }
+func (h *logMergeHeap) Push(x any)         { h.items = append(h.items, x.(logMergeItem)) }
+func (h *logMergeHeap) Pop() any {
+	n := len(h.items)
+	item := h.items[n-1]
+	h.items = h.items[:n-1]
+	return item
+}
+
+func (c *tikvClient) scanLogRange(m *kvMeta, tx *kvTxn, beginID, endID uint64, keysOnly bool, handler func(id uint64, k, v []byte) bool) {
+	itx := tx.kvtxn.(iterKvTxn)
+	shards := c.changeLogShards
+	iters := make([]kvIterator, shards)
+	for shard := 0; shard < shards; shard++ {
+		iters[shard] = itx.iter(m.fmtKey("XLOG", byte(shard), beginID), m.fmtKey("XLOG", byte(shard), endID), keysOnly)
+		defer iters[shard].Close()
+	}
+
+	h := &logMergeHeap{}
+	for i, it := range iters {
+		if it.Valid() {
+			id := parseTiKVLogID(it.Key())
+			h.items = append(h.items, logMergeItem{id: id, shard: i})
+		}
+	}
+	heap.Init(h)
+
+	for h.Len() > 0 {
+		item := heap.Pop(h).(logMergeItem)
+		it := iters[item.shard]
+		if !handler(item.id, it.Key(), it.Value()) {
+			return
+		}
+		if err := it.Next(); err != nil {
+			panic(err)
+		}
+		if it.Valid() {
+			id := parseTiKVLogID(it.Key())
+			heap.Push(h, logMergeItem{id: id, shard: item.shard})
+		}
+	}
+}
+
+func (c *tikvClient) rewind(id uint64, factor int) uint64 {
+	// TiKV's timestamp is in milliseconds, and the last 18 bits are for logical time,
+	// so we can rewind at most 10 seconds to avoid missing some logs
+	shift := uint64(10 * 1000 * (1 << 18))
+	if s := os.Getenv("JFS_TKV_REWIND"); s != "" {
+		if parsed, err := strconv.ParseUint(s, 10, 64); err == nil && parsed > 0 {
+			shift = parsed
+		}
+	}
+	if factor > 1 {
+		shift *= uint64(factor)
+	}
+	if id > shift {
+		return id - shift
+	}
+	return 1
+}
+
+type tikvClient struct {
+	client          *tikv.KVStore
+	gcInterval      time.Duration
+	changeLogShards int
+}
+
+func (c *tikvClient) name() string {
+	return "tikv"
+}
+
+func (c *tikvClient) shouldRetry(err error) bool {
+	return strings.Contains(err.Error(), "write conflict") || strings.Contains(err.Error(), "TxnLockNotFound")
+}
+
+func (c *tikvClient) config(key string) interface{} {
+	if key == "startTS" {
+		ts, err := c.client.CurrentTimestamp(oracle.GlobalTxnScope)
+		if err != nil {
+			logger.Warnf("TiKV get startTS: %s", err)
+			return nil
+		}
+		return ts
+	}
+	return nil
+}
+
+func (c *tikvClient) simpleTxn(ctx context.Context, f func(*kvTxn) error, retry int) (err error) {
+	tx, err := c.client.Begin(tikv.WithStartTS(math.MaxUint64)) // math.MaxUint64 means to point get the latest committed data without PD access
+	if err != nil {
+		return errors.Wrap(err, "failed to begin transaction")
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(error); ok {
+				err = e
+			} else {
+				err = errors.Errorf("panic in point get transaction: %v", r)
+			}
+		}
+	}()
+	if err = f(&kvTxn{&tikvTxn{tx}, retry}); err != nil {
+		return err
+	}
+	if !tx.IsReadOnly() {
+		return syscall.EINVAL
+	}
+	return nil
+}
+
+func (c *tikvClient) txn(ctx context.Context, f func(*kvTxn) error, retry int) (err error) {
+	var opts []tikv.TxnOption
+	if val := ctx.Value(txSessionKey{}); val != nil {
+		opts = append(opts, tikv.WithStartTS(val.(uint64)))
+	}
+
+	tx, err := c.client.Begin(opts...)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			fe, ok := r.(error)
+			if ok {
+				err = fe
+			} else {
+				err = errors.Errorf("tikv client txn func error: %v", r)
+			}
+		}
+	}()
+	if err = f(&kvTxn{&tikvTxn{tx}, retry}); err != nil {
+		return err
+	}
+	if !tx.IsReadOnly() {
+		tx.SetEnable1PC(true)
+		tx.SetEnableAsyncCommit(true)
+		err = tx.Commit(ctx)
+	}
+	return err
+}
+
+func (c *tikvClient) scan(prefix []byte, handler func(key, value []byte) bool) error {
+	end := nextKey(prefix)
+	start := prefix
+OUT:
+	for {
+		ts, err := c.client.CurrentTimestamp(oracle.GlobalTxnScope)
+		if err != nil {
+			return err
+		}
+		snap := c.client.GetSnapshot(ts)
+		snap.SetScanBatchSize(10240)
+		snap.SetNotFillCache(true)
+		snap.SetPriority(txnutil.PriorityLow)
+		it, err := snap.Iter(start, end)
+		if err != nil {
+			return err
+		}
+		var lastKey []byte
+		for it.Valid() && handler(it.Key(), it.Value()) {
+			lastKey = it.Key()
+			if err = it.Next(); err != nil {
+				it.Close()
+				if _, ok := err.(*tikverr.ErrGCTooEarly); !ok {
+					logger.Warnf("scan next key: %s", err)
+					return err
+				} else { // restart scan
+					start = nextKey(lastKey)
+					continue OUT
+				}
+			}
+		}
+		it.Close()
+		return nil
+	}
+}
+
+func (c *tikvClient) reset(prefix []byte) error {
+	_, err := c.client.DeleteRange(context.Background(), prefix, nextKey(prefix), 1)
+	return err
+}
+
+func (c *tikvClient) close() error {
+	return c.client.Close()
+}
+
+func (c *tikvClient) gc() {
+	if c.gcInterval == 0 {
+		return
+	}
+
+	currentTs, err := c.client.CurrentTimestamp(oracle.GlobalTxnScope)
+	if err != nil {
+		logger.Warnf("TiKV GC was skipped due to failure in obtaining the current timestamp.")
+		return
+	}
+
+	safePoint, err := c.client.GC(context.Background(), oracle.GoTimeToTS(oracle.GetTimeFromTS(currentTs).Add(-c.gcInterval)))
+	if err == nil {
+		logger.Debugf("TiKV GC returns new safe point: %d (%s)", safePoint, oracle.GetTimeFromTS(safePoint))
+	} else {
+		logger.Warnf("TiKV GC: %s", err)
+	}
+}

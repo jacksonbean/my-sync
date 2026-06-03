@@ -1,0 +1,256 @@
+//go:build !nogs
+// +build !nogs
+
+/*
+ * JuiceFS, Copyright 2018 Juicedata, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package object
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"cloud.google.com/go/compute/metadata"
+	"cloud.google.com/go/storage"
+	"github.com/pkg/errors"
+	"golang.org/x/oauth2/google"
+	"google.golang.org/api/iterator"
+)
+
+type gs struct {
+	DefaultObjectStorage
+	clients []*storage.Client
+	index   uint64
+	bucket  string
+	region  string
+	tierStorage
+}
+
+func (g *gs) String() string {
+	return fmt.Sprintf("gs://%s/", g.bucket)
+}
+
+func (g *gs) getClient() *storage.Client {
+	if len(g.clients) == 1 {
+		return g.clients[0]
+	}
+	n := atomic.AddUint64(&g.index, 1)
+	return g.clients[n%(uint64(len(g.clients)))]
+}
+
+func (g *gs) Create(ctx context.Context) error {
+	// check if the bucket is already exists
+	if objs, _, _, err := g.List(ctx, "", "", "", "", 1, true); err == nil && len(objs) > 0 {
+		return nil
+	}
+	projectID := os.Getenv("GOOGLE_CLOUD_PROJECT")
+	if projectID == "" {
+		projectID, _ = metadata.ProjectIDWithContext(ctx)
+	}
+	if projectID == "" {
+		cred, err := google.FindDefaultCredentials(ctx)
+		if err == nil {
+			projectID = cred.ProjectID
+		}
+	}
+	if projectID == "" {
+		return errors.New("GOOGLE_CLOUD_PROJECT environment variable must be set")
+	}
+	// Guess region when region is not provided
+	if g.region == "" {
+		zone, err := metadata.ZoneWithContext(ctx)
+		if err == nil && len(zone) > 2 {
+			g.region = zone[:len(zone)-2]
+		}
+	}
+
+	err := g.getClient().Bucket(g.bucket).Create(ctx, projectID, &storage.BucketAttrs{
+		Name:         g.bucket,
+		StorageClass: g.tiers[0].Sc,
+		Location:     g.region,
+	})
+	if err != nil && strings.Contains(err.Error(), "You already own this bucket") {
+		return nil
+	}
+	return err
+}
+
+func (g *gs) Head(ctx context.Context, key string) (Object, error) {
+	attrs, err := g.getClient().Bucket(g.bucket).Object(key).Attrs(ctx)
+	if err != nil {
+		if err == storage.ErrObjectNotExist {
+			err = os.ErrNotExist
+		}
+		return nil, err
+	}
+
+	return &objWithMeta{
+		obj: obj{
+			key:    key,
+			size:   attrs.Size,
+			mtime:  attrs.Updated,
+			isDir:  strings.HasSuffix(key, "/"),
+			sc:     attrs.StorageClass,
+			status: "",
+		},
+		contentType: attrs.ContentType,
+		metadata:    attrs.Metadata,
+	}, nil
+}
+
+func (g *gs) Get(ctx context.Context, key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
+	reader, err := g.getClient().Bucket(g.bucket).Object(key).NewRangeReader(ctx, off, limit)
+	if err != nil {
+		return nil, err
+	}
+	// TODO fire another attr request to get the actual storage class
+	attrs := ApplyGetters(getters...)
+	attrs.SetStorageClass(g.tiers[0].Sc)
+	return reader, nil
+}
+
+func (g *gs) Put(ctx context.Context, key string, data io.Reader, getters ...AttrGetter) error {
+	return g.put(ctx, key, data, ObjectMeta{}, getters...)
+}
+
+// PutWithMeta puts an object with the given metadata.
+func (g *gs) PutWithMeta(ctx context.Context, key string, data io.Reader, meta ObjectMeta, getters ...AttrGetter) error {
+	return g.put(ctx, key, data, meta, getters...)
+}
+
+func (g *gs) put(ctx context.Context, key string, data io.Reader, meta ObjectMeta, getters ...AttrGetter) error {
+	sc := g.GetStorageClass(ctx)
+	writer := g.getClient().Bucket(g.bucket).Object(key).NewWriter(ctx)
+	writer.StorageClass = sc
+	if meta.ContentType != "" {
+		writer.ContentType = meta.ContentType
+	}
+	if meta.Metadata != nil {
+		writer.Metadata = make(map[string]string)
+		for k, v := range meta.Metadata {
+			writer.Metadata[k] = v
+		}
+	}
+
+	// If you upload small objects (< 16MiB), you should set ChunkSize
+	// to a value slightly larger than the objects' sizes to avoid memory bloat.
+	// This is especially important if you are uploading many small objects concurrently.
+	writer.ChunkSize = 5 << 20
+
+	buf := bufPool.Get().(*[]byte)
+	defer bufPool.Put(buf)
+	_, err := io.CopyBuffer(writer, data, *buf)
+	if err != nil {
+		return err
+	}
+	attrs := ApplyGetters(getters...)
+	attrs.SetStorageClass(sc)
+	return writer.Close()
+}
+
+func (g *gs) Copy(ctx context.Context, dst, src string) error {
+	sc := getOrDefaultScValue(g.GetStorageClass(ctx), DefaultStorageClass)
+	client := g.getClient()
+	srcObj := client.Bucket(g.bucket).Object(src)
+	dstObj := client.Bucket(g.bucket).Object(dst)
+	copier := dstObj.CopierFrom(srcObj)
+	copier.StorageClass = sc
+	_, err := copier.Run(ctx)
+	return err
+}
+
+func (g *gs) Delete(ctx context.Context, key string, getters ...AttrGetter) error {
+	if err := g.getClient().Bucket(g.bucket).Object(key).Delete(ctx); err != storage.ErrObjectNotExist {
+		return err
+	}
+	return nil
+}
+
+func (g *gs) List(ctx context.Context, prefix, start, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
+	objectIterator := g.getClient().Bucket(g.bucket).Objects(ctx, &storage.Query{Prefix: prefix, Delimiter: delimiter, StartOffset: start})
+	pager := iterator.NewPager(objectIterator, int(limit), token)
+	var entries []*storage.ObjectAttrs
+	nextPageToken, err := pager.NextPage(&entries)
+	if err != nil {
+		return nil, false, "", err
+	}
+	n := len(entries)
+	objs := make([]Object, n)
+	for i := 0; i < n; i++ {
+		item := entries[i]
+		if delimiter != "" && item.Prefix != "" {
+			objs[i] = &obj{item.Prefix, 0, time.Unix(0, 0), true, item.StorageClass, ""}
+		} else {
+			objs[i] = &obj{item.Name, item.Size, item.Updated, strings.HasSuffix(item.Name, "/"), item.StorageClass, ""}
+		}
+	}
+	if delimiter != "" {
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
+	}
+	return objs, nextPageToken != "", nextPageToken, nil
+}
+
+// Restore GCS does not support restoring objects to a temporary readable state.
+func (g *gs) Restore(ctx context.Context, key string, days int32) error {
+	return notSupported
+}
+func newGS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {
+	if !strings.Contains(endpoint, "://") {
+		endpoint = fmt.Sprintf("gs://%s", endpoint)
+	}
+	uri, err := url.ParseRequestURI(endpoint)
+	if err != nil {
+		return nil, errors.Errorf("Invalid endpoint: %v, error: %v", endpoint, err)
+	}
+	hostParts := strings.Split(uri.Host, ".")
+	bucket := hostParts[0]
+	var region string
+	if len(hostParts) > 1 {
+		region = hostParts[1]
+	}
+
+	var size int
+	if ssize := os.Getenv("JFS_NUM_GOOGLE_CLIENTS"); ssize != "" {
+		if size, err = strconv.Atoi(ssize); err != nil {
+			return nil, err
+		}
+	}
+	if size < 1 {
+		size = 5
+	}
+	clis := make([]*storage.Client, size)
+	for i := 0; i < size; i++ {
+		client, err := storage.NewClient(ctx)
+		if err != nil {
+			return nil, err
+		}
+		clis[i] = client
+	}
+
+	return &gs{clients: clis, bucket: bucket, region: region}, nil
+}
+
+func init() {
+	Register("gs", newGS)
+}

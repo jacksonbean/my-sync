@@ -1,0 +1,179 @@
+#!/bin/bash -e
+
+# Common variables and initialization
+init_platform() {
+    case "$(uname -s)" in
+        Darwin*)    PLATFORM="mac";;
+        Linux*)     PLATFORM="linux";;
+        *)          PLATFORM="unknown"
+    esac
+
+    # Install jq if missing
+    if ! command -v jq &> /dev/null; then
+        case "$PLATFORM" in
+            mac)    brew install jq;;
+            linux)  .github/scripts/apt_install.sh jq;;
+            *)      echo "Unsupported platform"; exit 1
+        esac
+    fi
+}
+
+# Platform-agnostic functions with internal branching
+cleanup_test_mounts() {
+    case "$PLATFORM" in
+        mac)
+            for mp in ~/jfs3 ~/jfs2 ~/jfs; do
+                ./juicefs umount "$mp" 2>/dev/null || true
+                umount_jfs "$mp" "$META_URL"
+            done
+            ;;
+        linux)
+            for mp in /jfs3 /jfs2 /jfs; do
+                ./juicefs umount "$mp" 2>/dev/null || true
+                umount_jfs "$mp" "$META_URL"
+            done
+            ;;
+    esac
+}
+
+prepare_test() {
+    case "$PLATFORM" in
+        mac)
+            cleanup_test_mounts
+            sleep 1
+            python3 .github/scripts/flush_meta.py "$META_URL"
+            rm -rf ~/.juicefs/local/myjfs/ || true
+            rm -rf ~/.juicefs/cache || true
+            ;;
+        linux)
+            cleanup_test_mounts
+            python3 .github/scripts/flush_meta.py "$META_URL"
+            rm -rf /var/jfs/myjfs || true
+            rm -rf /var/jfsCache/myjfs || true
+            ;;
+    esac
+}
+
+umount_jfs() {
+    local mp=$1
+    local meta_url=$2
+    [[ -z "$mp" ]] && echo "mount point is empty" && exit 1
+    [[ -z "$meta_url" ]] && echo "meta url is empty" && exit 1
+    
+    echo "umount_jfs $mp $meta_url"
+    [[ ! -f "$mp/.config" ]] && return
+    
+    ls -l "$mp/.config"
+    local status_log="status.log"
+    ./juicefs status --log-level error "$meta_url" 2>/dev/null | grep -v '^\[xorm\]' | tee "$status_log"
+    
+    local pids
+    pids=$(jq --arg mp "$mp" '.Sessions[] | select(.MountPoint == $mp) | .ProcessID' "$status_log")
+    [[ -z "$pids" ]] && cat "$status_log" && echo "pid is empty" && return
+    
+    echo "umount is $mp, pids are $pids"
+    
+    for pid in $pids; do
+        case "$PLATFORM" in
+            mac)
+                if mount | grep -q "$mp"; then
+                    diskutil unmount "$mp" || umount "$mp"
+                fi
+                ;;
+            linux)
+                umount -l "$mp"
+                ;;
+        esac
+    done
+    
+    for pid in $pids; do
+        wait_mount_process_killed "$pid" 60
+    done
+}
+
+wait_mount_process_killed() {
+    local pid=$1
+    local wait_seconds=$2
+    [[ -z "$pid" ]] && echo "pid is empty" && exit 1
+    [[ -z "$wait_seconds" ]] && echo "wait_seconds is empty" && exit 1
+    
+    echo "waiting for mount process $pid to exit within $wait_seconds seconds"
+    for i in $(seq 1 "$wait_seconds"); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "mount process is killed"
+            break
+        fi
+        
+        if [ "$i" -eq "$wait_seconds" ]; then
+            case "$PLATFORM" in
+                mac)    ps -p "$pid";;
+                linux)  ps -fp "$pid" 2>/dev/null || true;;
+            esac
+            echo "<FATAL>: mount process is not killed after $wait_seconds"
+            exit 1
+        fi
+        sleep 1
+    done
+}
+
+compare_md5sum() {
+    local file1=$1
+    local file2=$2
+    
+    case "$PLATFORM" in
+        mac)
+            md51=$(md5 -q "$file1")
+            md52=$(md5 -q "$file2")
+            ;;
+        linux)
+            md51=$(md5sum "$file1" | awk '{print $1}')
+            md52=$(md5sum "$file2" | awk '{print $1}')
+            ;;
+    esac
+    
+    if [ "$md51" != "$md52" ]; then
+        echo "md5 are different: $file1 ($md51) vs $file2 ($md52)"
+        exit 1
+    fi
+}
+
+wait_command_success() {
+    local command=$1
+    local expected=$2
+    local timeout=${3:-30}
+    
+    echo "waiting for command success: cmd='$command', expected='$expected', timeout=$timeout"
+    for i in $(seq 1 "$timeout"); do
+        result=$(eval "$command" 2>/dev/null | tr -d ' ')
+        echo "attempt $i: result=$result"
+        
+        if [[ "$result" == "$expected" ]]; then
+            echo "command succeeded"
+            return 0
+        fi
+        
+        if [ "$i" -eq "$timeout" ]; then
+            eval "$command"
+            echo "command failed after $timeout attempts: $command"
+            exit 1
+        fi
+        sleep 1
+    done
+}
+
+# macOS specific helper (only defined but used when needed)
+ensure_directory() {
+    [[ "$PLATFORM" != "mac" ]] && return
+    local dir=$1
+    if [[ ! -d "$dir" ]]; then
+        echo "Creating directory: $dir"
+        mkdir -p "$dir"
+    fi
+}
+
+# Initialize platform detection
+init_platform
+
+# Make functions available to subprocesses
+export -f cleanup_test_mounts prepare_test umount_jfs wait_mount_process_killed compare_md5sum wait_command_success ensure_directory
+export PLATFORM META_URL

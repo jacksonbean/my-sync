@@ -1,0 +1,398 @@
+//go:build !nocos
+// +build !nocos
+
+/*
+ * JuiceFS, Copyright 2018 Juicedata, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package object
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/pkg/errors"
+
+	"github.com/tencentyun/cos-go-sdk-v5"
+)
+
+const (
+	cosChecksumKey        = "x-cos-meta-" + checksumAlgr
+	cosRequestIDKey       = "X-Cos-Request-Id"
+	cosStorageClassHeader = "X-Cos-Storage-Class"
+	cosRestoreStatus      = "x-cos-restore-status"
+)
+
+type COS struct {
+	c        *cos.Client
+	endpoint string
+	tierStorage
+}
+
+func (c *COS) String() string {
+	return fmt.Sprintf("cos://%s/", strings.Split(c.endpoint, ".")[0])
+}
+
+func (c *COS) Create(ctx context.Context) error {
+	_, err := c.c.Bucket.Put(ctx, nil)
+	if err != nil && isExists(err) {
+		err = nil
+	}
+	return err
+}
+
+func (c *COS) Limits() Limits {
+	return Limits{
+		IsSupportMultipartUpload: true,
+		IsSupportUploadPartCopy:  true,
+		MinPartSize:              1 << 20,
+		MaxPartSize:              5 << 30,
+		MaxPartCount:             10000,
+	}
+}
+
+func (c *COS) Head(ctx context.Context, key string) (Object, error) {
+	resp, err := c.c.Object.Head(ctx, key, nil)
+	if err != nil {
+		if exist, err := c.c.Object.IsExist(ctx, key); err == nil && !exist {
+			return nil, os.ErrNotExist
+		}
+		return nil, err
+	}
+	header := resp.Header
+	var size int64
+	if val, ok := header["Content-Length"]; ok {
+		if length, err := strconv.ParseInt(val[0], 10, 64); err == nil {
+			size = length
+		}
+	}
+	var mtime time.Time
+	if val, ok := header["Last-Modified"]; ok {
+		mtime, _ = time.Parse(time.RFC1123, val[0])
+	}
+	var sc string
+	if val := header.Get(cosStorageClassHeader); val != "" {
+		sc = val
+	} else {
+		sc = "STANDARD"
+	}
+	// Extract user metadata (x-cos-meta-* headers)
+	meta := make(map[string]string)
+	for k := range header {
+		if strings.HasPrefix(strings.ToLower(k), "x-cos-meta-") && len(header[k]) > 0 {
+			meta[k] = header[k][0]
+		}
+	}
+	return &objWithMeta{
+		obj: obj{
+			key:    key,
+			size:   size,
+			mtime:  mtime,
+			isDir:  strings.HasSuffix(key, "/"),
+			sc:     sc,
+			status: header.Get(cosRestoreStatus),
+		},
+		contentType: header.Get("Content-Type"),
+		metadata:    meta,
+	}, nil
+}
+
+func (c *COS) Get(ctx context.Context, key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
+	params := &cos.ObjectGetOptions{Range: getRange(off, limit)}
+	resp, err := c.c.Object.Get(ctx, key, params)
+	if err != nil {
+		return nil, err
+	}
+	if err = checkGetStatus(resp.StatusCode, params.Range != ""); err != nil {
+		_ = resp.Body.Close()
+		return nil, err
+	}
+	if off == 0 && limit == -1 {
+		length, err := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+		if err != nil {
+			length = -1
+			logger.Warnf("failed to parse content-length %s: %s", resp.Header.Get("Content-Length"), err)
+		}
+		resp.Body = verifyChecksum(resp.Body, resp.Header.Get(cosChecksumKey), length)
+	}
+	if resp != nil {
+		attrs := ApplyGetters(getters...)
+		attrs.SetRequestID(resp.Header.Get(cosRequestIDKey)).SetStorageClass(resp.Header.Get(cosStorageClassHeader))
+	}
+	return resp.Body, nil
+}
+
+func (c *COS) Restore(ctx context.Context, key string, days int32) error {
+	_, err := c.c.Object.PostRestore(ctx, key, &cos.ObjectRestoreOptions{
+		Days: int(days),
+		Tier: &cos.CASJobParameters{
+			Tier: "Standard",
+		},
+	})
+	return err
+}
+
+func (c *COS) Put(ctx context.Context, key string, in io.Reader, getters ...AttrGetter) error {
+	return c.put(ctx, key, in, ObjectMeta{}, getters...)
+}
+
+// PutWithMeta puts an object with the given metadata.
+func (c *COS) PutWithMeta(ctx context.Context, key string, in io.Reader, meta ObjectMeta, getters ...AttrGetter) error {
+	return c.put(ctx, key, in, meta, getters...)
+}
+
+func (c *COS) put(ctx context.Context, key string, in io.Reader, meta ObjectMeta, getters ...AttrGetter) error {
+	sc := c.GetStorageClass(ctx)
+	var options cos.ObjectPutOptions
+	headerOpts := &cos.ObjectPutHeaderOptions{}
+	if meta.ContentType != "" {
+		headerOpts.ContentType = meta.ContentType
+	}
+	if len(meta.Metadata) > 0 {
+		metaHeader := http.Header{}
+		for k, v := range meta.Metadata {
+			metaHeader.Set(k, v)
+		}
+		headerOpts.XCosMetaXXX = &metaHeader
+	}
+	if sc != "" {
+		headerOpts.XCosStorageClass = sc
+	}
+	options.ObjectPutHeaderOptions = headerOpts
+	resp, err := c.c.Object.Put(ctx, key, in, &options)
+	if resp != nil {
+		attrs := ApplyGetters(getters...)
+		attrs.SetRequestID(resp.Header.Get(cosRequestIDKey)).SetStorageClass(sc)
+	}
+	return err
+}
+
+func (c *COS) Copy(ctx context.Context, dst, src string) error {
+	sc := getOrDefaultScValue(c.GetStorageClass(ctx), DefaultStorageClass)
+	var opt cos.ObjectCopyOptions
+	opt.ObjectCopyHeaderOptions = &cos.ObjectCopyHeaderOptions{XCosStorageClass: sc}
+	source := fmt.Sprintf("%s/%s", c.endpoint, src)
+	_, _, err := c.c.Object.Copy(ctx, dst, source, &opt)
+	return err
+}
+
+func (c *COS) Delete(ctx context.Context, key string, getters ...AttrGetter) error {
+	resp, err := c.c.Object.Delete(ctx, key)
+	if resp != nil {
+		attrs := ApplyGetters(getters...)
+		attrs.SetRequestID(resp.Header.Get(cosRequestIDKey))
+	}
+	return err
+}
+
+func (c *COS) List(ctx context.Context, prefix, start, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
+	param := cos.BucketGetOptions{
+		Prefix:       prefix,
+		Marker:       start,
+		MaxKeys:      int(limit),
+		Delimiter:    delimiter,
+		EncodingType: "url",
+	}
+	resp, _, err := c.c.Bucket.Get(ctx, &param)
+	if err != nil {
+		return nil, false, "", err
+	}
+	n := len(resp.Contents)
+	objs := make([]Object, n)
+	for i := 0; i < n; i++ {
+		o := resp.Contents[i]
+		t, _ := time.Parse(time.RFC3339, o.LastModified)
+		key, err := cos.DecodeURIComponent(o.Key)
+		if err != nil {
+			return nil, false, "", errors.WithMessagef(err, "failed to decode key %s", o.Key)
+		}
+		objs[i] = &obj{key, int64(o.Size), t, strings.HasSuffix(key, "/"), o.StorageClass, ""}
+	}
+	if delimiter != "" {
+		for _, p := range resp.CommonPrefixes {
+			key, err := cos.DecodeURIComponent(p)
+			if err != nil {
+				return nil, false, "", errors.WithMessagef(err, "failed to decode commonPrefixes %s", p)
+			}
+			objs = append(objs, &obj{key, 0, time.Unix(0, 0), true, "", ""})
+		}
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
+	}
+	return objs, resp.IsTruncated, resp.NextMarker, nil
+}
+
+func (c *COS) ListAll(ctx context.Context, prefix, marker string, followLink bool) (<-chan Object, error) {
+	return nil, notSupported
+}
+
+func (c *COS) CreateMultipartUpload(ctx context.Context, key string) (*MultipartUpload, error) {
+	return c.createMultipartUpload(ctx, key, ObjectMeta{})
+}
+
+// CreateMultipartUploadWithMeta creates a multipart upload with metadata.
+func (c *COS) CreateMultipartUploadWithMeta(ctx context.Context, key string, meta ObjectMeta) (*MultipartUpload, error) {
+	return c.createMultipartUpload(ctx, key, meta)
+}
+
+func (c *COS) createMultipartUpload(ctx context.Context, key string, meta ObjectMeta) (*MultipartUpload, error) {
+	var options cos.InitiateMultipartUploadOptions
+	headerOpts := &cos.ObjectPutHeaderOptions{}
+	if c.tiers[0].Sc != "" {
+		headerOpts.XCosStorageClass = c.tiers[0].Sc
+	}
+	if meta.ContentType != "" {
+		headerOpts.ContentType = meta.ContentType
+	}
+	if meta.Metadata != nil {
+		metaHeader := http.Header{}
+		for k, v := range meta.Metadata {
+			metaHeader.Set(k, v)
+		}
+		headerOpts.XCosMetaXXX = &metaHeader
+	}
+	options.ObjectPutHeaderOptions = headerOpts
+	resp, _, err := c.c.Object.InitiateMultipartUpload(ctx, key, &options)
+	if err != nil {
+		return nil, err
+	}
+	return &MultipartUpload{UploadID: resp.UploadID, MinPartSize: 5 << 20, MaxCount: 10000}, nil
+}
+
+func (c *COS) UploadPart(ctx context.Context, key string, uploadID string, num int, body []byte) (*Part, error) {
+	resp, err := c.c.Object.UploadPart(ctx, key, uploadID, num, bytes.NewReader(body), nil)
+	if err != nil {
+		return nil, err
+	}
+	return &Part{Num: num, ETag: resp.Header.Get("Etag")}, nil
+}
+
+func (c *COS) UploadPartCopy(ctx context.Context, key string, uploadID string, num int, srcKey string, off, size int64) (*Part, error) {
+	result, _, err := c.c.Object.CopyPart(ctx, key, uploadID, num, c.endpoint+"/"+srcKey, &cos.ObjectCopyPartOptions{
+		XCosCopySourceRange: fmt.Sprintf("bytes=%d-%d", off, off+size-1),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Part{Num: num, ETag: result.ETag}, nil
+}
+
+func (c *COS) AbortUpload(ctx context.Context, key string, uploadID string) {
+	_, _ = c.c.Object.AbortMultipartUpload(ctx, key, uploadID)
+}
+
+func (c *COS) CompleteUpload(ctx context.Context, key string, uploadID string, parts []*Part) error {
+	var cosParts []cos.Object
+	for i := range parts {
+		cosParts = append(cosParts, cos.Object{ETag: parts[i].ETag, PartNumber: parts[i].Num})
+	}
+	_, _, err := c.c.Object.CompleteMultipartUpload(ctx, key, uploadID, &cos.CompleteMultipartUploadOptions{Parts: cosParts})
+	return err
+}
+
+func (c *COS) ListUploads(ctx context.Context, marker string) ([]*PendingPart, string, error) {
+	input := &cos.ListMultipartUploadsOptions{
+		KeyMarker: marker,
+	}
+	result, _, err := c.c.Bucket.ListMultipartUploads(ctx, input)
+	if err != nil {
+		return nil, "", err
+	}
+	parts := make([]*PendingPart, len(result.Uploads))
+	for i, u := range result.Uploads {
+		t, _ := time.Parse(time.RFC3339, u.Initiated)
+		parts[i] = &PendingPart{u.Key, u.UploadID, t}
+	}
+	return parts, result.NextKeyMarker, nil
+}
+
+func autoCOSEndpoint(bucketName, accessKey, secretKey, token string) (string, error) {
+	client := cos.NewClient(nil, &http.Client{
+		Transport: &cos.AuthorizationTransport{
+			SecretID:     accessKey,
+			SecretKey:    secretKey,
+			SessionToken: token,
+		},
+	})
+	client.UserAgent = UserAgent
+	s, _, err := client.Service.Get(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	for _, b := range s.Buckets {
+		// fmt.Printf("%#v\n", b)
+		if b.Name == bucketName {
+			return fmt.Sprintf("https://%s.cos.%s.myqcloud.com", b.Name, b.Region), nil
+		}
+	}
+
+	return "", fmt.Errorf("bucket %q doesn't exist", bucketName)
+}
+
+func newCOS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {
+	if !strings.Contains(endpoint, "://") {
+		endpoint = fmt.Sprintf("https://%s", endpoint)
+	}
+	uri, err := url.ParseRequestURI(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("Invalid endpoint %s: %s", endpoint, err)
+	}
+	hostParts := strings.SplitN(uri.Host, ".", 2)
+
+	if accessKey == "" {
+		accessKey = os.Getenv("COS_SECRETID")
+		secretKey = os.Getenv("COS_SECRETKEY")
+	}
+
+	if len(hostParts) == 1 {
+		if endpoint, err = autoCOSEndpoint(hostParts[0], accessKey, secretKey, token); err != nil {
+			return nil, fmt.Errorf("Unable to get endpoint of bucket %s: %s", hostParts[0], err)
+		}
+		if uri, err = url.ParseRequestURI(endpoint); err != nil {
+			return nil, fmt.Errorf("Invalid endpoint %s: %s", endpoint, err)
+		}
+		logger.Debugf("Use endpoint %q", endpoint)
+	}
+
+	b := &cos.BaseURL{BucketURL: uri}
+	client := cos.NewClient(b, &http.Client{
+		Transport: &cos.AuthorizationTransport{
+			SecretID:     accessKey,
+			SecretKey:    secretKey,
+			SessionToken: token,
+			Transport:    httpClient.Transport,
+		},
+	})
+	client.UserAgent = UserAgent
+	disableChecksum := strings.EqualFold(uri.Query().Get("disable-checksum"), "true")
+	if disableChecksum {
+		logger.Infof("default CRC checksum is disabled")
+	}
+	client.Conf.EnableCRC = !disableChecksum
+	return &COS{c: client, endpoint: uri.Host}, nil
+}
+
+func init() {
+	Register("cos", newCOS)
+}
