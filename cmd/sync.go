@@ -193,6 +193,14 @@ func syncActionFlags() []cli.Flag {
 			Name:  "preserve-meta",
 			Usage: "preserve content-type and user-defined metadata (e.g. x-amz-meta-* headers) from source objects",
 		},
+		&cli.StringFlag{
+			Name:  "db",
+			Usage: "record sync results to MySQL database (e.g. mysql://user:pass@host:3306/dbname)",
+		},
+		&cli.BoolFlag{
+			Name:  "scan",
+			Usage: "scan-only mode: compare source and dest objects without copying, record results to --db",
+		},
 		&cli.BoolFlag{
 			Name:    "links",
 			Aliases: []string{"l"},

@@ -39,6 +39,7 @@ import (
 	"unicode"
 
 	"github.com/juicedata/juicefs/pkg/object"
+	sync_db "github.com/juicedata/juicefs/pkg/sync/db"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juju/ratelimit"
 	"github.com/prometheus/client_golang/prometheus"
@@ -193,6 +194,9 @@ var crcTable = crc32.MakeTable(crc32.Castagnoli)
 var logger = utils.GetLogger("juicefs")
 var ctx = context.Background()
 var preserveMeta bool
+var syncDbService *sync_db.AsyncDbService
+var syncDbJobID string
+var lastSrcMeta object.ObjectMeta // cached from copy paths to avoid Head in record
 
 func incrTotal(n int64) {
 	totalHandled.Add(n)
@@ -660,6 +664,7 @@ func doCopySingle(src, dst object.ObjectStorage, key string, size int64, calChks
 				if !preserveMeta {
 					srcMeta.Metadata = nil
 				}
+				lastSrcMeta = srcMeta
 				if mp, ok2 := dst.(object.MetadataPutter); ok2 {
 					err = mp.PutWithMeta(ctx, key, &withProgress{r}, srcMeta)
 					return r.chksum, err
@@ -683,6 +688,7 @@ func doCopySingle0(src, dst object.ObjectStorage, key string, size int64, calChk
 	if !preserveMeta {
 		srcMeta.Metadata = nil
 	}
+	lastSrcMeta = srcMeta
 	if size == 0 {
 		if key == "" && !object.IsFileSystem(dst) {
 			ps := strings.SplitN(dst.String(), "/", 4)
@@ -730,6 +736,33 @@ func getSrcMeta(src object.ObjectStorage, key string) (object.ObjectMeta, bool) 
 		ContentType: srcObj.ContentType(),
 		Metadata:    srcObj.Metadata(),
 	}, true
+}
+
+// recordSyncObject sends an object sync result to the db service (non-blocking).
+func recordSyncObject(jobID, key string, size int64, startTime time.Time, status sync_db.ObjectStatus, errMsg string) {
+	if syncDbService == nil {
+		return
+	}
+	contentType := lastSrcMeta.ContentType
+	meta := lastSrcMeta.Metadata
+	var metaJSON string
+	if len(meta) > 0 {
+		if b, e := json.Marshal(meta); e == nil {
+			metaJSON = string(b)
+		}
+	}
+	_ = syncDbService.RecordObject(sync_db.ObjectRecord{
+		JobID:       jobID,
+		SourceKey:   key,
+		TargetKey:   key,
+		Size:        size,
+		ContentType: contentType,
+		Metadata:    metaJSON,
+		Status:      status,
+		ErrorMsg:    errMsg,
+		StartTime:   startTime,
+		EndTime:     time.Now(),
+	})
 }
 
 type withProgress struct {
@@ -1016,6 +1049,7 @@ func copyData(src, dst object.ObjectStorage, key string, size int64, mtime time.
 				if !preserveMeta {
 					srcMeta.Metadata = nil
 				}
+				lastSrcMeta = srcMeta
 				if srcMeta.ContentType != "" || len(srcMeta.Metadata) > 0 {
 					if mc, ok2 := dst.(object.MetadataMultipartCreator); ok2 {
 						upload, err = mc.CreateMultipartUploadWithMeta(ctx, key, srcMeta)
@@ -1188,7 +1222,7 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 					err = fmt.Errorf("checksums of copied object %s don't match", key)
 				}
 			}
-			if err == nil {
+		if err == nil {
 				if mc, ok := dst.(object.MtimeChanger); ok {
 					if err = mc.Chtimes(obj.Key(), obj.Mtime()); err != nil && !errors.Is(err, utils.ErrNotSUP) {
 						logger.Warnf("Update mtime of %s: %s", key, err)
@@ -1198,12 +1232,21 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 					copyPerms(dst, obj, config)
 				}
 				copied.Increment()
+				if syncDbService != nil {
+					recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusCopied, "")
+				}
 			} else if errors.Is(err, utils.ErrSkipped) {
 				skipped.Increment()
+				if syncDbService != nil {
+					recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusSkipped, "")
+				}
 			} else {
 				failed.Increment()
 				logger.Errorf("Failed to copy object %s: %s", key, err)
 				taskErr = err
+				if syncDbService != nil {
+					recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusFailed, err.Error())
+				}
 			}
 			if taskErr == nil && config.DeleteSrcAfter {
 				if obj.IsDir() {
@@ -2061,9 +2104,139 @@ func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, pr
 	return nil
 }
 
+// scanOnly compares source and destination objects without copying, recording results to db.
+func scanOnly(src, dst object.ObjectStorage) error {
+	srcObjects, err := listAll(src, "", "", "", true, true)
+	if err != nil {
+		return fmt.Errorf("list source: %w", err)
+	}
+
+	var total, matches, differs, missing, errors int64
+	startTime := time.Now()
+
+	for obj := range srcObjects {
+		if obj == nil {
+			break
+		}
+		total++
+		key := obj.Key()
+
+		// Head destination
+		dstObj, dstErr := dst.Head(ctx, key)
+		status := sync_db.StatusMissing
+		if dstErr == nil {
+			if dstObj.Size() == obj.Size() {
+				status = sync_db.StatusMatches
+				matches++
+			} else {
+				status = sync_db.StatusDiffers
+				differs++
+			}
+		} else if os.IsNotExist(dstErr) {
+			status = sync_db.StatusMissing
+			missing++
+		} else {
+			status = sync_db.StatusFailed
+			errors++
+		}
+
+		// Record to db
+		srcMeta, _ := getSrcMeta(src, key)
+		var metaJSON string
+		if srcMeta.Metadata != nil {
+			if b, e := json.Marshal(srcMeta.Metadata); e == nil {
+				metaJSON = string(b)
+			}
+		}
+		_ = syncDbService.RecordObject(sync_db.ObjectRecord{
+			JobID:       syncDbJobID,
+			SourceKey:   key,
+			TargetKey:   key,
+			Size:        obj.Size(),
+			ContentType: srcMeta.ContentType,
+			Metadata:    metaJSON,
+			Status:      status,
+			StartTime:   startTime,
+			EndTime:     time.Now(),
+		})
+
+		if total%1000 == 0 {
+			logger.Infof("Scanned %d objects (matches: %d, differs: %d, missing: %d, errors: %d)",
+				total, matches, differs, missing, errors)
+		}
+	}
+
+	logger.Infof("Scan complete: %d objects (matches: %d, differs: %d, missing: %d, errors: %d) in %s",
+		total, matches, differs, missing, errors, time.Since(startTime))
+
+	// End job
+	_ = syncDbService.Close()
+	_ = syncDbService.EndJob(syncDbJobID, sync_db.JobInfo{
+		ID:          syncDbJobID,
+		Status:      sync_db.JobCompleted,
+		EndTime:     time.Now(),
+		TotalObjects: total,
+		CopiedObjects: matches,
+		SkippedObjects: differs,
+		FailedObjects: errors,
+		DeletedObjects: missing,
+	})
+	return nil
+}
+
 // Sync syncs all the keys between to object storage
 func Sync(src, dst object.ObjectStorage, config *Config) error {
 	preserveMeta = config.PreserveMeta
+
+	// Initialize db service if configured
+	if config.DbDSN != "" {
+		driver, dsn, err := sync_db.ParseDbDSN(config.DbDSN)
+		if err != nil {
+			logger.Errorf("Failed to parse db url: %v", err)
+		} else {
+			var svc sync_db.DbService
+			switch driver {
+			case "mysql":
+				svc, err = sync_db.NewMySQLService(dsn)
+			default:
+				err = fmt.Errorf("unsupported db driver: %s", driver)
+			}
+			if err != nil {
+				logger.Errorf("Failed to connect to db: %v", err)
+			} else {
+				syncDbService = sync_db.NewAsyncDbService(svc)
+				syncDbJobID = sync_db.GenerateJobID(dst.String(), time.Now())
+				logger.Infof("Syncing to db with job ID: %s", syncDbJobID)
+			}
+		}
+	}
+
+	// Scan-only mode: compare without copying
+	if config.Scan {
+		if syncDbService == nil {
+			return fmt.Errorf("--scan requires --db to record results")
+		}
+		_ = syncDbService.StartJob(sync_db.JobInfo{
+			ID:        syncDbJobID,
+			SrcURL:    src.String(),
+			DstURL:    dst.String(),
+			StartTime: time.Now(),
+			Status:    sync_db.JobRunning,
+		})
+		return scanOnly(src, dst)
+	}
+
+	// Start db job for normal sync
+	if syncDbService != nil {
+		_ = syncDbService.StartJob(sync_db.JobInfo{
+			ID:        syncDbJobID,
+			SrcURL:    src.String(),
+			DstURL:    dst.String(),
+			StartTime: time.Now(),
+			Status:    sync_db.JobRunning,
+		})
+	}
+
 	var checkpointMgr *CheckpointManager
 	var checkpoint *Checkpoint
 	var uploads multipartUploads
@@ -2257,7 +2430,28 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 			if total-handled.Current()-extra.Current() > 0 {
 				msg += fmt.Sprintf(", lost: %d", total-handled.Current()-extra.Current())
 			}
+
 			logger.Info(msg)
+			// End db job (Close first to flush all records, then update stats)
+			if syncDbService != nil {
+				_ = syncDbService.Close()
+				jobStatus := sync_db.JobCompleted
+				if failed != nil && failed.Current() > 0 {
+					jobStatus = sync_db.JobFailed
+				}
+				_ = syncDbService.EndJob(syncDbJobID, sync_db.JobInfo{
+					ID:             syncDbJobID,
+					Status:         jobStatus,
+					EndTime:        time.Now(),
+					TotalObjects:   handled.GetTotal(),
+					CopiedObjects:  copied.Current(),
+					SkippedObjects: skipped.Current(),
+					FailedObjects:  func() int64 { if failed != nil { return failed.Current() }; return 0 }(),
+					DeletedObjects: func() int64 { if deleted != nil { return deleted.Current() }; return 0 }(),
+					TotalBytes:     copiedBytes.Current(),
+				})
+			}
+
 
 			if failed != nil {
 				if n := failed.Current(); n > 0 || total > handled.Current()+extra.Current() {

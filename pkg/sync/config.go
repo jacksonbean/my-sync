@@ -78,6 +78,8 @@ type Config struct {
 	CheckpointInterval   time.Duration
 	CheckpointForceReset bool
 	PreserveMeta         bool
+	DbDSN                string
+	Scan                 bool
 
 	rules          []rule
 	concurrentList chan int              `json:"-"`
@@ -223,6 +225,8 @@ func NewConfigFromCli(c *cli.Context) *Config {
 		CheckpointInterval:   c.Duration("checkpoint-interval"),
 		CheckpointForceReset: c.Bool("checkpoint-force-reset"),
 		PreserveMeta:         c.Bool("preserve-meta"),
+		DbDSN:                c.String("db"),
+		Scan:                 c.Bool("scan"),
 		Env:                  make(map[string]string),
 	}
 	if !c.IsSet("max-size") {
