@@ -157,6 +157,12 @@ func (s *ks3) put(ctx context.Context, key string, in io.Reader, meta ObjectMeta
 		Body:        body,
 		ContentType: &mimeType,
 	}
+	if meta.Metadata != nil {
+		params.Metadata = make(map[string]*string)
+		for k, v := range meta.Metadata {
+			params.Metadata[k] = aws.String(v)
+		}
+	}
 	sc := s.GetStorageClass(ctx)
 	if sc != "" {
 		params.StorageClass = aws.String(sc)
