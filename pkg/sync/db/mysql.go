@@ -10,15 +10,27 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
-// mysqlService implements DbService backed by MySQL.
+const (
+	dbSyncJobs  = "sync_jobs"
+	dbSyncData  = "juicefs_sync"
+	dbScanJobs  = "scan_jobs"
+	dbScanData  = "scan_sync"
+)
+
+// mysqlService implements DbService backed by MySQL with separate databases for jobs and data.
 type mysqlService struct {
 	db          *sql.DB
+	host        string
+	user        string
+	pass        string
+	isScan      bool
 	objectsTable string // per-job table name, set by StartJob
 	mu          sync.Mutex
 }
 
 // NewMySQLService creates a new MySQL-backed DbService.
-func NewMySQLService(dsn string) (DbService, error) {
+func NewMySQLService(cfg *DbConfig, isScan bool) (DbService, error) {
+	dsn := fmt.Sprintf("%s:%s@tcp(%s)/?charset=utf8mb4&parseTime=True&loc=Local", cfg.User, cfg.Pass, cfg.Host)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err
@@ -32,16 +44,40 @@ func NewMySQLService(dsn string) (DbService, error) {
 		return nil, fmt.Errorf("mysql ping failed: %w", err)
 	}
 
-	svc := &mysqlService{db: db}
-	if err := svc.createJobsTable(); err != nil {
+	svc := &mysqlService{db: db, host: cfg.Host, user: cfg.User, pass: cfg.Pass, isScan: isScan}
+	if err := svc.createDatabases(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return svc, nil
 }
 
+func (s *mysqlService) createDatabases() error {
+	dbs := []string{dbSyncJobs, dbSyncData, dbScanJobs, dbScanData}
+	for _, name := range dbs {
+		if _, err := s.db.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", name)); err != nil {
+			return fmt.Errorf("create database %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func (s *mysqlService) jobsDB() string {
+	if s.isScan {
+		return dbScanJobs
+	}
+	return dbSyncJobs
+}
+
+func (s *mysqlService) dataDB() string {
+	if s.isScan {
+		return dbScanData
+	}
+	return dbSyncData
+}
+
 func (s *mysqlService) createJobsTable() error {
-	jobsSQL := `CREATE TABLE IF NOT EXISTS sync_jobs (
+	sql := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS `+"`%s`"+`.`+"`sync_jobs`"+` (
 		id VARCHAR(128) PRIMARY KEY,
 		src_url TEXT NOT NULL,
 		dst_url TEXT NOT NULL,
@@ -54,18 +90,15 @@ func (s *mysqlService) createJobsTable() error {
 		deleted_objects BIGINT DEFAULT 0,
 		total_bytes BIGINT DEFAULT 0,
 		status VARCHAR(16) DEFAULT 'running'
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-	if _, err := s.db.Exec(jobsSQL); err != nil {
-		return fmt.Errorf("create sync_jobs: %w", err)
-	}
-	return nil
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, s.jobsDB())
+	_, err := s.db.Exec(sql)
+	return err
 }
 
 func (s *mysqlService) createObjectsTable(tableName string) error {
-	// Sanitize table name
 	tableName = strings.ReplaceAll(tableName, "-", "_")
 	tableName = strings.ReplaceAll(tableName, ".", "_")
-	sql := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+	sql := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS `+"`%s`"+`.`+"`%s`"+` (
 		id BIGINT AUTO_INCREMENT PRIMARY KEY,
 		source_key VARCHAR(2048) NOT NULL,
 		target_key VARCHAR(2048),
@@ -77,16 +110,19 @@ func (s *mysqlService) createObjectsTable(tableName string) error {
 		start_time DATETIME(3),
 		end_time DATETIME(3),
 		INDEX idx_status (status)
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, tableName)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, s.dataDB(), tableName)
 	_, err := s.db.Exec(sql)
 	return err
 }
 
 func (s *mysqlService) StartJob(job JobInfo) error {
-	// Insert job record
-	jobsSQL := `INSERT INTO sync_jobs
+	if err := s.createJobsTable(); err != nil {
+		return fmt.Errorf("create jobs table: %w", err)
+	}
+
+	jobsSQL := fmt.Sprintf(`INSERT INTO `+"`%s`"+`.`+"`sync_jobs`"+`
 		(id, src_url, dst_url, start_time, end_time, total_objects, copied_objects, skipped_objects, failed_objects, deleted_objects, total_bytes, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.jobsDB())
 	var endTime interface{}
 	if job.EndTime.IsZero() {
 		endTime = nil
@@ -100,7 +136,6 @@ func (s *mysqlService) StartJob(job JobInfo) error {
 		return err
 	}
 
-	// Create per-job objects table
 	tableName := "objects_" + strings.ReplaceAll(strings.ReplaceAll(job.ID, "-", "_"), ".", "_")
 	if err := s.createObjectsTable(tableName); err != nil {
 		return fmt.Errorf("create objects table %s: %w", tableName, err)
@@ -118,9 +153,9 @@ func (s *mysqlService) RecordObject(rec ObjectRecord) error {
 	if table == "" {
 		return fmt.Errorf("no active job")
 	}
-	objectsSQL := fmt.Sprintf(`INSERT INTO %s
+	objectsSQL := fmt.Sprintf(`INSERT INTO `+"`%s`"+`.`+"`%s`"+`
 		(source_key, target_key, size, content_type, metadata_json, status, error_msg, start_time, end_time)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, table)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.dataDB(), table)
 	_, err := s.db.Exec(objectsSQL,
 		rec.SourceKey, rec.TargetKey, rec.Size,
 		rec.ContentType, rec.Metadata, string(rec.Status), rec.ErrorMsg,
@@ -129,7 +164,7 @@ func (s *mysqlService) RecordObject(rec ObjectRecord) error {
 }
 
 func (s *mysqlService) EndJob(jobID string, job JobInfo) error {
-	sql := `UPDATE sync_jobs SET status = ?, end_time = ?, total_objects = ?, copied_objects = ?, skipped_objects = ?, failed_objects = ?, deleted_objects = ?, total_bytes = ? WHERE id = ?`
+	sql := fmt.Sprintf(`UPDATE `+"`%s`"+`.`+"`sync_jobs`"+` SET status = ?, end_time = ?, total_objects = ?, copied_objects = ?, skipped_objects = ?, failed_objects = ?, deleted_objects = ?, total_bytes = ? WHERE id = ?`, s.jobsDB())
 	_, err := s.db.Exec(sql, string(job.Status), job.EndTime,
 		job.TotalObjects, job.CopiedObjects, job.SkippedObjects,
 		job.FailedObjects, job.DeletedObjects, job.TotalBytes, jobID)

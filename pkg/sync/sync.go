@@ -2220,17 +2220,11 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 
 	// Initialize db service if configured
 	if config.DbDSN != "" {
-		driver, dsn, err := sync_db.ParseDbDSN(config.DbDSN)
+		cfg, err := sync_db.ParseDbDSN(config.DbDSN)
 		if err != nil {
 			logger.Errorf("Failed to parse db url: %v", err)
 		} else {
-			var svc sync_db.DbService
-			switch driver {
-			case "mysql":
-				svc, err = sync_db.NewMySQLService(dsn)
-			default:
-				err = fmt.Errorf("unsupported db driver: %s", driver)
-			}
+			svc, err := sync_db.NewMySQLService(cfg, config.Scan)
 			if err != nil {
 				logger.Errorf("Failed to connect to db: %v", err)
 			} else {
@@ -2246,13 +2240,15 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		if syncDbService == nil {
 			return fmt.Errorf("--scan requires --db to record results")
 		}
-		_ = syncDbService.StartJob(sync_db.JobInfo{
+		if err := syncDbService.StartJob(sync_db.JobInfo{
 			ID:        syncDbJobID,
 			SrcURL:    src.String(),
 			DstURL:    dst.String(),
 			StartTime: time.Now(),
 			Status:    sync_db.JobRunning,
-		})
+		}); err != nil {
+			logger.Errorf("Failed to start db job: %v", err)
+		}
 		return scanOnly(src, dst)
 	}
 
@@ -2266,8 +2262,6 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 			Status:    sync_db.JobRunning,
 		}); err != nil {
 			logger.Errorf("Failed to start db job: %v", err)
-		} else {
-			logger.Infof("DB DEBUG: StartJob succeeded")
 		}
 	}
 

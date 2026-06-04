@@ -21,7 +21,7 @@ const (
 	StatusFailed  ObjectStatus = "failed"
 	StatusDeleted ObjectStatus = "deleted"
 	StatusMissing ObjectStatus = "missing" // scan: not on destination
-	StatusDiffers ObjectStatus = "differs" // scan: size/mtime differs
+	StatusDiffers ObjectStatus = "differs" // scan: size differs
 	StatusMatches ObjectStatus = "matches" // scan: identical on both sides
 )
 
@@ -36,7 +36,7 @@ const (
 
 // JobInfo holds summary info for a sync job.
 type JobInfo struct {
-	ID             string    // dest_bucket_202606031430
+	ID             string // dest_bucket_202606031430
 	SrcURL         string
 	DstURL         string
 	StartTime      time.Time
@@ -64,12 +64,18 @@ type ObjectRecord struct {
 	EndTime     time.Time
 }
 
+// DbConfig holds parsed database connection info.
+type DbConfig struct {
+	Driver string
+	Host   string // host:port
+	User   string
+	Pass   string
+}
+
 // GenerateJobID creates a job ID from the destination bucket name and current time.
 func GenerateJobID(dstURL string, t time.Time) string {
-	// Extract bucket from URL like "s3://127.0.0.1:9001/bucket-b/"
 	u, err := url.Parse(dstURL)
 	if err != nil {
-		// Fallback: use trimmed URL
 		dstURL = strings.TrimPrefix(dstURL, "s3://")
 		dstURL = strings.TrimPrefix(dstURL, "cos://")
 		dstURL = strings.TrimPrefix(dstURL, "oss://")
@@ -81,12 +87,10 @@ func GenerateJobID(dstURL string, t time.Time) string {
 		}
 		return fmt.Sprintf("%s_%s", bucket, t.Format("200601021504"))
 	}
-	// Extract bucket from host
 	host := u.Host
 	if idx := strings.Index(host, "."); idx > 0 {
 		host = host[:idx]
 	}
-	// Also include path prefix if present
 	path := strings.Trim(u.Path, "/")
 	if path != "" {
 		host = host + "_" + strings.ReplaceAll(path, "/", "_")
@@ -102,30 +106,28 @@ type DbService interface {
 	Close() error
 }
 
-// ParseDbDSN extracts the database driver name and DSN from a connection string.
-// Supported formats:
-//
-//	mysql://user:pass@host:port/dbname
-func ParseDbDSN(raw string) (driver, dsn string, err error) {
+// ParseDbDSN extracts connection info from a URL string.
+// Supported format: mysql://user:pass@host:port
+func ParseDbDSN(raw string) (*DbConfig, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", "", fmt.Errorf("invalid db url: %w", err)
+		return nil, fmt.Errorf("invalid db url: %w", err)
 	}
-	driver = strings.ToLower(u.Scheme)
-	switch driver {
-	case "mysql":
-		pass, _ := u.User.Password()
-		host := u.Host
-		if !strings.Contains(host, ":") {
-			host += ":3306"
-		}
-		path := strings.TrimPrefix(u.Path, "/")
-		dsn = fmt.Sprintf("%s:%s@tcp(%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
-			u.User.Username(), pass, host, path)
-	default:
-		return "", "", fmt.Errorf("unsupported db driver: %s", driver)
+	driver := strings.ToLower(u.Scheme)
+	if driver != "mysql" {
+		return nil, fmt.Errorf("unsupported db driver: %s", driver)
 	}
-	return
+	pass, _ := u.User.Password()
+	host := u.Host
+	if !strings.Contains(host, ":") {
+		host += ":3306"
+	}
+	return &DbConfig{
+		Driver: driver,
+		Host:   host,
+		User:   u.User.Username(),
+		Pass:   pass,
+	}, nil
 }
 
 // channelSize is the buffer size for the object record channel.
@@ -140,13 +142,13 @@ const flushInterval = time.Second
 // AsyncDbService wraps a DbService with a buffered channel, batch writes, and non-blocking sends.
 type AsyncDbService struct {
 	DbService
-	ch      chan ObjectRecord
-	wg      sync.WaitGroup
-	done    chan struct{}
-	closed  bool
-	mu      sync.Mutex
-	errors  []error
-	batch   []ObjectRecord
+	ch     chan ObjectRecord
+	wg     sync.WaitGroup
+	done   chan struct{}
+	closed bool
+	mu     sync.Mutex
+	errors []error
+	batch  []ObjectRecord
 }
 
 // NewAsyncDbService creates an AsyncDbService that buffers and batch-writes object records.
@@ -170,7 +172,6 @@ func (a *AsyncDbService) worker() {
 		select {
 		case rec, ok := <-a.ch:
 			if !ok {
-				// Channel closed, flush remaining
 				a.flushBatch()
 				return
 			}
@@ -201,9 +202,8 @@ func (a *AsyncDbService) flushBatch() {
 	a.batch = a.batch[:0]
 }
 
-// sendSafe sends to channel, returns false if channel closed or full.
 func sendSafe(ch chan ObjectRecord, rec ObjectRecord) (sent bool) {
-	defer func() { recover() }() // catch panic from send on closed channel
+	defer func() { recover() }()
 	select {
 	case ch <- rec:
 		return true
@@ -213,7 +213,6 @@ func sendSafe(ch chan ObjectRecord, rec ObjectRecord) (sent bool) {
 }
 
 // RecordObject sends an object record to the async channel (non-blocking).
-// Drops the record if channel is full or closed — DB issues never block migration.
 func (a *AsyncDbService) RecordObject(rec ObjectRecord) error {
 	if !sendSafe(a.ch, rec) {
 		a.mu.Lock()
