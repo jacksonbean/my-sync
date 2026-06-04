@@ -196,8 +196,7 @@ var ctx = context.Background()
 var preserveMeta bool
 var syncDbService *sync_db.AsyncDbService
 var syncDbJobID string
-var lastSrcMeta object.ObjectMeta // cached from copy paths to avoid Head in record
-var syncSrc object.ObjectStorage  // source storage for Head in recordSyncObject
+var syncSrc object.ObjectStorage // source storage for Head in recordSyncObject
 
 func incrTotal(n int64) {
 	totalHandled.Add(n)
@@ -665,8 +664,7 @@ func doCopySingle(src, dst object.ObjectStorage, key string, size int64, calChks
 				if !preserveMeta {
 					srcMeta.Metadata = nil
 				}
-				lastSrcMeta = srcMeta
-				if mp, ok2 := dst.(object.MetadataPutter); ok2 {
+							if mp, ok2 := dst.(object.MetadataPutter); ok2 {
 					err = mp.PutWithMeta(ctx, key, &withProgress{r}, srcMeta)
 					return r.chksum, err
 				}
@@ -689,7 +687,6 @@ func doCopySingle0(src, dst object.ObjectStorage, key string, size int64, calChk
 	if !preserveMeta {
 		srcMeta.Metadata = nil
 	}
-	lastSrcMeta = srcMeta
 	if size == 0 {
 		if key == "" && !object.IsFileSystem(dst) {
 			ps := strings.SplitN(dst.String(), "/", 4)
@@ -744,10 +741,9 @@ func recordSyncObject(jobID, key string, size int64, startTime time.Time, status
 	if syncDbService == nil {
 		return
 	}
-	contentType := lastSrcMeta.ContentType
-	meta := lastSrcMeta.Metadata
-	// Fallback: producer-level skip may not have lastSrcMeta cached
-	if contentType == "" && meta == nil && syncSrc != nil {
+	contentType := ""
+	var meta map[string]string
+	if syncSrc != nil {
 		if srcObj, err := syncSrc.Head(ctx, key); err == nil {
 			contentType = srcObj.ContentType()
 			meta = srcObj.Metadata()
@@ -1057,8 +1053,7 @@ func copyData(src, dst object.ObjectStorage, key string, size int64, mtime time.
 				if !preserveMeta {
 					srcMeta.Metadata = nil
 				}
-				lastSrcMeta = srcMeta
-				if srcMeta.ContentType != "" || len(srcMeta.Metadata) > 0 {
+							if srcMeta.ContentType != "" || len(srcMeta.Metadata) > 0 {
 					if mc, ok2 := dst.(object.MetadataMultipartCreator); ok2 {
 						upload, err = mc.CreateMultipartUploadWithMeta(ctx, key, srcMeta)
 					}
