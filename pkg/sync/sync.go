@@ -1147,8 +1147,14 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 		switch obj.Size() {
 		case markDeleteSrc:
 			taskErr = deleteObj(src, key, config.Dry)
+			if syncDbService != nil {
+				recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusDeleted, "")
+			}
 		case markDeleteDst:
 			taskErr = deleteObj(dst, key, config.Dry)
+			if syncDbService != nil {
+				recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusDeleted, "")
+			}
 		case markCopyPerms:
 			if config.Dry {
 				logger.Debugf("Will copy permissions for %s", key)
