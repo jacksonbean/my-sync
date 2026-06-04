@@ -18,14 +18,14 @@
 # 普通 sync：保留 Content-Type
 juicefs sync s3://src-bucket/ s3://dst-bucket/
 
-# 同步时保留 Content-Type 和自定义 Metadata
+# 保留 Content-Type 和自定义 Metadata
 juicefs sync --preserve-meta s3://src-bucket/ s3://dst-bucket/
 
-# 同步并将结果记录到 MySQL
-juicefs sync --db "mysql://user:pass@host:3306/dbname" s3://src-bucket/ s3://dst-bucket/
+# 同步并记录到 MySQL
+juicefs sync --db "mysql://user:pass@host:3306" s3://src-bucket/ s3://dst-bucket/
 
-# 扫描模式：只对比源和目标，不实际传输，结果写入 MySQL
-juicefs sync --scan --db "mysql://user:pass@host:3306/dbname" s3://src-bucket/ s3://dst-bucket/
+# 扫描模式：只对比不传输，结果写入 MySQL
+juicefs sync --scan --db "mysql://user:pass@host:3306" s3://src-bucket/ s3://dst-bucket/
 ```
 
 ## 参数说明
@@ -33,12 +33,23 @@ juicefs sync --scan --db "mysql://user:pass@host:3306/dbname" s3://src-bucket/ s
 | 参数 | 说明 |
 |------|------|
 | `--preserve-meta` | 保留源对象的 Content-Type 和 x-amz-meta-* 自定义元数据 |
-| `--db` | MySQL 连接串，格式 `mysql://user:pass@host:3306/dbname` |
+| `--db` | MySQL 连接串，格式 `mysql://user:pass@host:port`（无需指定库名） |
 | `--scan` | 扫描模式：列出源对象，对比目标端，结果写入数据库，不实际拷贝 |
 
-## 数据库表结构
+## 数据库架构
 
-`sync_jobs` — 每次 sync/scan 一条记录：
+`--db` 需要 MySQL 用户有 `CREATE DATABASE` 权限，启动时自动创建 4 个数据库：
+
+| 数据库 | 用途 |
+|--------|------|
+| `sync_jobs` | sync 模式的任务记录（`sync_jobs` 表） |
+| `juicefs_sync` | sync 模式的对象明细（`objects_{job_id}` 表） |
+| `scan_jobs` | scan 模式的任务记录（`sync_jobs` 表） |
+| `scan_sync` | scan 模式的对象明细（`objects_{job_id}` 表） |
+
+### sync_jobs 表
+
+每次 sync/scan 一条记录：
 
 | 字段 | 说明 |
 |------|------|
@@ -49,13 +60,14 @@ juicefs sync --scan --db "mysql://user:pass@host:3306/dbname" s3://src-bucket/ s
 | total_bytes | 拷贝总字节数 |
 | status | running / completed / failed |
 
-`sync_objects` — 每个对象一条记录：
+### objects_{job_id} 表
+
+每个任务独立一张表，每个对象一条记录：
 
 | 字段 | 说明 |
 |------|------|
-| job_id | 关联任务 ID |
 | source_key / target_key | 对象路径 |
-| size / content_type / metadata_json | 对象属性 |
+| size / content_type / metadata_json | 对象属性（JSON 格式） |
 | status | copied / skipped / failed / deleted / missing / differs / matches |
 | error_msg | 错误信息 |
 | start_time / end_time | 处理起止时间 |
