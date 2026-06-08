@@ -2128,6 +2128,40 @@ func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, pr
 	return nil
 }
 
+// scanSingle lists a single bucket and records object metadata via ListObjects (no Head calls).
+func scanSingle(src object.ObjectStorage) error {
+	srcObjects, err := listAll(src, "", "", "", true, true)
+	if err != nil {
+		return fmt.Errorf("list source: %w", err)
+	}
+
+	var total int64
+	startTime := time.Now()
+
+	for obj := range srcObjects {
+		if obj == nil {
+			break
+		}
+		total++
+		_ = syncDbService.RecordObject(sync_db.ObjectRecord{
+			JobID:       syncDbJobID,
+			SourceKey:   obj.Key(),
+			Size:        obj.Size(),
+			EndTime:     obj.Mtime(),
+			ContentType: obj.StorageClass(),
+		})
+
+		if total%10000 == 0 {
+			logger.Infof("Scanned %d objects...", total)
+		}
+	}
+
+	logger.Infof("Single scan complete: %d objects in %s", total, time.Since(startTime))
+
+	_ = syncDbService.Close()
+	return nil
+}
+
 // scanOnly compares source and destination objects without copying, recording results to db.
 func scanOnly(src, dst object.ObjectStorage) error {
 	srcObjects, err := listAll(src, "", "", "", true, true)
@@ -2219,7 +2253,7 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		if err != nil {
 			logger.Errorf("Failed to parse db url: %v", err)
 		} else {
-			svc, err := sync_db.NewMySQLService(cfg, config.Scan)
+			svc, err := sync_db.NewMySQLService(cfg, config.Scan, config.ScanSingle)
 			if err != nil {
 				logger.Errorf("Failed to connect to db: %v", err)
 			} else {
@@ -2228,6 +2262,22 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 				logger.Infof("Syncing to db with job ID: %s", syncDbJobID)
 			}
 		}
+	}
+
+	// Scan-single mode: list one bucket, record metadata via ListObjects only
+	if config.ScanSingle {
+		if syncDbService == nil {
+			return fmt.Errorf("--scan-single requires --db")
+		}
+		syncDbJobID = sync_db.GenerateJobID(src.String(), time.Now())
+		if err := syncDbService.StartJob(sync_db.JobInfo{
+			ID:        syncDbJobID,
+			SrcURL:    src.String(),
+			StartTime: time.Now(),
+		}); err != nil {
+			return fmt.Errorf("failed to start single scan: %w", err)
+		}
+		return scanSingle(src)
 	}
 
 	// Scan-only mode: compare without copying

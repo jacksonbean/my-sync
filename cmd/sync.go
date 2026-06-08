@@ -202,6 +202,10 @@ func syncActionFlags() []cli.Flag {
 			Usage: "scan-only mode: compare source and dest objects without copying, record results to --db",
 		},
 		&cli.BoolFlag{
+			Name:  "scan-single",
+			Usage: "scan a single bucket and record object metadata to --db via ListObjects only (no Head calls)",
+		},
+		&cli.BoolFlag{
 			Name:    "links",
 			Aliases: []string{"l"},
 			Usage:   "copy symlinks as symlinks",

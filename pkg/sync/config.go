@@ -80,6 +80,7 @@ type Config struct {
 	PreserveMeta         bool
 	DbDSN                string
 	Scan                 bool
+	ScanSingle           bool
 
 	rules          []rule
 	concurrentList chan int              `json:"-"`
@@ -227,6 +228,7 @@ func NewConfigFromCli(c *cli.Context) *Config {
 		PreserveMeta:         c.Bool("preserve-meta"),
 		DbDSN:                c.String("db"),
 		Scan:                 c.Bool("scan"),
+		ScanSingle:           c.Bool("scan-single"),
 		Env:                  make(map[string]string),
 	}
 	if !c.IsSet("max-size") {
