@@ -529,7 +529,12 @@ func wrapSyncEncryptedStore(store object.ObjectStorage, keyPath, passphraseEnv, 
 }
 
 func doSync(c *cli.Context) error {
-	setup(c, 2)
+	// scan-single only needs 1 argument (SRC), normal sync needs 2 (SRC DST)
+	if c.IsSet("scan-single") {
+		setup0(c, 1, 2)
+	} else {
+		setup(c, 2)
+	}
 	if c.IsSet("include") && !c.IsSet("exclude") {
 		logger.Warnf("The include option needs to be used with the exclude option, otherwise the result of the current sync may not match your expectations")
 	}
@@ -541,6 +546,10 @@ func doSync(c *cli.Context) error {
 	// Windows support `\` and `/` as its separator, Unix only use `/`
 	srcURL := c.Args().Get(0)
 	dstURL := c.Args().Get(1)
+	// scan-single only needs one URL
+	if config.ScanSingle && dstURL == "" {
+		dstURL = srcURL
+	}
 	removePassword(srcURL, dstURL)
 	if runtime.GOOS == "windows" {
 		if !strings.Contains(srcURL, "://") {
@@ -550,7 +559,7 @@ func doSync(c *cli.Context) error {
 			dstURL = strings.ReplaceAll(dstURL, "\\", "/")
 		}
 	}
-	if strings.HasSuffix(srcURL, "/") != strings.HasSuffix(dstURL, "/") {
+	if !config.ScanSingle && strings.HasSuffix(srcURL, "/") != strings.HasSuffix(dstURL, "/") {
 		logger.Fatalf("SRC and DST should both end with path separator or not!")
 	}
 	src, err := createSyncStorage(srcURL, config)
