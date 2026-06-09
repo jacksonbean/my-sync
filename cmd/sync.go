@@ -205,6 +205,14 @@ func syncActionFlags() []cli.Flag {
 			Name:  "scan-single",
 			Usage: "scan a single bucket and record object metadata to --db via ListObjects only (no Head calls)",
 		},
+		&cli.StringFlag{
+			Name:  "output",
+			Usage: "output scan results to CSV file (use with --scan or --scan-single)",
+		},
+		&cli.StringFlag{
+			Name:  "dashboard",
+			Usage: "start web dashboard on given address (e.g. :8080)",
+		},
 		&cli.BoolFlag{
 			Name:    "links",
 			Aliases: []string{"l"},

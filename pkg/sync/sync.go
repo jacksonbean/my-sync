@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -198,6 +199,8 @@ var syncDbService *sync_db.AsyncDbService
 var syncDbJobID string
 var syncSrc object.ObjectStorage    // source storage for Head in recordSyncObject
 var srcMetaCache sync.Map          // key → object.ObjectMeta, cache from copy paths
+var outputCSV *csv.Writer
+var outputCSVFile *os.File
 
 func incrTotal(n int64) {
 	totalHandled.Add(n)
@@ -2151,18 +2154,27 @@ func scanSingle(src object.ObjectStorage) error {
 	var total int64
 	startTime := time.Now()
 
+	if outputCSV != nil {
+		outputCSV.Write([]string{"source_key", "size", "last_modified", "storage_class"})
+	}
+
 	for obj := range srcObjects {
 		if obj == nil {
 			break
 		}
 		total++
-		_ = syncDbService.RecordObject(sync_db.ObjectRecord{
-			JobID:       syncDbJobID,
-			SourceKey:   obj.Key(),
-			Size:        obj.Size(),
-			EndTime:     obj.Mtime(),
-			ContentType: obj.StorageClass(),
-		})
+		if syncDbService != nil {
+			_ = syncDbService.RecordObject(sync_db.ObjectRecord{
+				JobID:       syncDbJobID,
+				SourceKey:   obj.Key(),
+				Size:        obj.Size(),
+				EndTime:     obj.Mtime(),
+				ContentType: obj.StorageClass(),
+			})
+		}
+		if outputCSV != nil {
+			outputCSV.Write([]string{obj.Key(), fmt.Sprintf("%d", obj.Size()), obj.Mtime().Format("2006-01-02 15:04:05"), obj.StorageClass()})
+		}
 
 		if total%10000 == 0 {
 			logger.Infof("Scanned %d objects...", total)
@@ -2172,6 +2184,37 @@ func scanSingle(src object.ObjectStorage) error {
 	logger.Infof("Single scan complete: %d objects in %s", total, time.Since(startTime))
 
 	_ = syncDbService.Close()
+	return nil
+}
+
+// scanOnlyCSV compares source and destination objects and writes results to CSV only (no DB).
+func scanOnlyCSV(src, dst object.ObjectStorage) error {
+	srcObjects, err := listAll(src, "", "", "", true, true)
+	if err != nil {
+		return fmt.Errorf("list source: %w", err)
+	}
+	outputCSV.Write([]string{"source_key", "size", "content_type", "status"})
+
+	var total int64
+	for obj := range srcObjects {
+		if obj == nil {
+			break
+		}
+		total++
+		key := obj.Key()
+		dstObj, dstErr := dst.Head(ctx, key)
+		status := "missing"
+		if dstErr == nil {
+			if dstObj.Size() == obj.Size() {
+				status = "matches"
+			} else {
+				status = "differs"
+			}
+		}
+		srcMeta, _ := getSrcMeta(src, key)
+		outputCSV.Write([]string{key, fmt.Sprintf("%d", obj.Size()), srcMeta.ContentType, status})
+	}
+	logger.Infof("Scan complete: %d objects written to CSV", total)
 	return nil
 }
 
@@ -2185,6 +2228,10 @@ func scanOnly(src, dst object.ObjectStorage) error {
 	var total, matches, differs, missing, errors, extras int64
 	startTime := time.Now()
 	srcKeys := make(map[string]bool)
+
+	if outputCSV != nil {
+		outputCSV.Write([]string{"source_key", "size", "content_type", "status"})
+	}
 
 	for obj := range srcObjects {
 		if obj == nil {
@@ -2237,6 +2284,9 @@ func scanOnly(src, dst object.ObjectStorage) error {
 			logger.Infof("Scanned %d objects (matches: %d, differs: %d, missing: %d, errors: %d)",
 				total, matches, differs, missing, errors)
 		}
+		if outputCSV != nil {
+			outputCSV.Write([]string{key, fmt.Sprintf("%d", obj.Size()), srcMeta.ContentType, string(status)})
+		}
 	}
 
 	logger.Infof("Scan complete: %d objects (matches: %d, differs: %d, missing: %d, errors: %d) in %s",
@@ -2285,6 +2335,26 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 	preserveMeta = config.PreserveMeta
 	syncSrc = src
 
+	// Init CSV output if configured
+	if config.OutputFile != "" {
+		f, err := os.Create(config.OutputFile)
+		if err != nil {
+			return fmt.Errorf("create output file: %w", err)
+		}
+		outputCSVFile = f
+		outputCSV = csv.NewWriter(f)
+	}
+	defer func() {
+		if outputCSV != nil {
+			outputCSV.Flush()
+			outputCSVFile.Close()
+		}
+	}()
+
+	if config.Dashboard != "" {
+		startDashboard(config.Dashboard)
+	}
+
 	// Initialize db service if configured
 	if config.DbDSN != "" {
 		cfg, err := sync_db.ParseDbDSN(config.DbDSN)
@@ -2304,24 +2374,29 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 
 	// Scan-single mode: list one bucket, record metadata via ListObjects only
 	if config.ScanSingle {
-		if syncDbService == nil {
-			return fmt.Errorf("--scan-single requires --db")
+		if syncDbService == nil && outputCSV == nil {
+			return fmt.Errorf("--scan-single requires --db or --output")
 		}
-		syncDbJobID = sync_db.GenerateJobID(src.String(), time.Now())
-		if err := syncDbService.StartJob(sync_db.JobInfo{
-			ID:        syncDbJobID,
-			SrcURL:    src.String(),
-			StartTime: time.Now(),
-		}); err != nil {
-			return fmt.Errorf("failed to start single scan: %w", err)
+		if syncDbService != nil {
+			syncDbJobID = sync_db.GenerateJobID(src.String(), time.Now())
+			if err := syncDbService.StartJob(sync_db.JobInfo{
+				ID:        syncDbJobID,
+				SrcURL:    src.String(),
+				StartTime: time.Now(),
+			}); err != nil {
+				return fmt.Errorf("failed to start single scan: %w", err)
+			}
 		}
 		return scanSingle(src)
 	}
 
 	// Scan-only mode: compare without copying
 	if config.Scan {
+		if syncDbService == nil && outputCSV == nil {
+			return fmt.Errorf("--scan requires --db or --output")
+		}
 		if syncDbService == nil {
-			return fmt.Errorf("--scan requires --db to record results")
+			return scanOnlyCSV(src, dst)
 		}
 		if err := syncDbService.StartJob(sync_db.JobInfo{
 			ID:        syncDbJobID,

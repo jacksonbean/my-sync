@@ -81,6 +81,8 @@ type Config struct {
 	DbDSN                string
 	Scan                 bool
 	ScanSingle           bool
+	OutputFile           string
+	Dashboard            string
 
 	rules          []rule
 	concurrentList chan int              `json:"-"`
@@ -229,6 +231,8 @@ func NewConfigFromCli(c *cli.Context) *Config {
 		DbDSN:                c.String("db"),
 		Scan:                 c.Bool("scan"),
 		ScanSingle:           c.Bool("scan-single"),
+		OutputFile:           c.String("output"),
+		Dashboard:            c.String("dashboard"),
 		Env:                  make(map[string]string),
 	}
 	if !c.IsSet("max-size") {

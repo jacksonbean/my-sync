@@ -17,6 +17,7 @@ func Main(args []string) error {
 		Copyright: "Apache 2.0",
 		Commands: []*cli.Command{
 			cmdSync(),
+			cmdDashboard(),
 		},
 		Flags: globalFlags(),
 	}
