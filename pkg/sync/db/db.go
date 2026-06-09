@@ -23,6 +23,7 @@ const (
 	StatusMissing ObjectStatus = "missing" // scan: not on destination
 	StatusDiffers ObjectStatus = "differs" // scan: size differs
 	StatusMatches ObjectStatus = "matches" // scan: identical on both sides
+	StatusExtra   ObjectStatus = "extra"   // scan: on destination but not source
 )
 
 // JobStatus is the overall sync job status.
@@ -144,7 +145,6 @@ type AsyncDbService struct {
 	DbService
 	ch     chan ObjectRecord
 	wg     sync.WaitGroup
-	done   chan struct{}
 	closed bool
 	mu     sync.Mutex
 	errors []error
@@ -156,7 +156,6 @@ func NewAsyncDbService(svc DbService) *AsyncDbService {
 	a := &AsyncDbService{
 		DbService: svc,
 		ch:        make(chan ObjectRecord, channelSize),
-		done:      make(chan struct{}),
 		batch:     make([]ObjectRecord, 0, batchSize),
 	}
 	a.wg.Add(1)
@@ -231,7 +230,6 @@ func (a *AsyncDbService) Close() error {
 	}
 	a.mu.Unlock()
 	a.wg.Wait()
-	close(a.done)
 	a.mu.Lock()
 	errCount := len(a.errors)
 	a.mu.Unlock()

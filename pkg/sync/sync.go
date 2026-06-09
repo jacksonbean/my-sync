@@ -196,7 +196,8 @@ var ctx = context.Background()
 var preserveMeta bool
 var syncDbService *sync_db.AsyncDbService
 var syncDbJobID string
-var syncSrc object.ObjectStorage // source storage for Head in recordSyncObject
+var syncSrc object.ObjectStorage    // source storage for Head in recordSyncObject
+var srcMetaCache sync.Map          // key → object.ObjectMeta, cache from copy paths
 
 func incrTotal(n int64) {
 	totalHandled.Add(n)
@@ -687,6 +688,7 @@ func doCopySingle0(src, dst object.ObjectStorage, key string, size int64, calChk
 	if !preserveMeta {
 		srcMeta.Metadata = nil
 	}
+	srcMetaCache.Store(key, srcMeta)
 	if size == 0 {
 		if key == "" && !object.IsFileSystem(dst) {
 			ps := strings.SplitN(dst.String(), "/", 4)
@@ -743,7 +745,12 @@ func recordSyncObject(jobID, key string, size int64, startTime time.Time, status
 	}
 	contentType := ""
 	var meta map[string]string
-	if syncSrc != nil {
+	// Try cache from copy paths first, fallback to Head
+	if v, ok := srcMetaCache.LoadAndDelete(key); ok {
+		m := v.(object.ObjectMeta)
+		contentType = m.ContentType
+		meta = m.Metadata
+	} else if syncSrc != nil {
 		if srcObj, err := syncSrc.Head(ctx, key); err == nil {
 			contentType = srcObj.ContentType()
 			meta = srcObj.Metadata()
@@ -1153,6 +1160,9 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 		case markCopyPerms:
 			if config.Dry {
 				logger.Debugf("Will copy permissions for %s", key)
+				if syncDbService != nil {
+					recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusCopied, "")
+				}
 			} else {
 				copyPerms(dst, withoutSize(obj), config)
 			}
@@ -1161,6 +1171,9 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 			if config.Dry {
 				logger.Debugf("Will compare checksum for %s", key)
 				checked.Increment()
+				if syncDbService != nil {
+					recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusSkipped, "")
+				}
 				break
 			}
 			obj = withoutSize(obj)
@@ -2169,8 +2182,9 @@ func scanOnly(src, dst object.ObjectStorage) error {
 		return fmt.Errorf("list source: %w", err)
 	}
 
-	var total, matches, differs, missing, errors int64
+	var total, matches, differs, missing, errors, extras int64
 	startTime := time.Now()
+	srcKeys := make(map[string]bool)
 
 	for obj := range srcObjects {
 		if obj == nil {
@@ -2178,6 +2192,7 @@ func scanOnly(src, dst object.ObjectStorage) error {
 		}
 		total++
 		key := obj.Key()
+		srcKeys[key] = true
 
 		// Head destination
 		dstObj, dstErr := dst.Head(ctx, key)
@@ -2226,6 +2241,29 @@ func scanOnly(src, dst object.ObjectStorage) error {
 
 	logger.Infof("Scan complete: %d objects (matches: %d, differs: %d, missing: %d, errors: %d) in %s",
 		total, matches, differs, missing, errors, time.Since(startTime))
+
+	// Phase 2: detect extra objects on destination
+	dstObjects, dstErr := listAll(dst, "", "", "", true, true)
+	if dstErr == nil {
+		for obj := range dstObjects {
+			if obj == nil {
+				break
+			}
+			key := obj.Key()
+			if !srcKeys[key] {
+				extras++
+				_ = syncDbService.RecordObject(sync_db.ObjectRecord{
+					JobID:     syncDbJobID,
+					TargetKey: key,
+					Size:      obj.Size(),
+					Status:    sync_db.StatusExtra,
+					StartTime: startTime,
+					EndTime:   time.Now(),
+				})
+			}
+		}
+		logger.Infof("Extra objects on destination: %d", extras)
+	}
 
 	// End job
 	_ = syncDbService.Close()
