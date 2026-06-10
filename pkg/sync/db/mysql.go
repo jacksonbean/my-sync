@@ -141,10 +141,10 @@ func (s *mysqlService) StartJob(job JobInfo) error {
 		if err := s.createJobsTable(); err != nil {
 			return fmt.Errorf("create jobs table: %w", err)
 		}
-		// Insert into sync_jobs so it appears in history
+		// Insert into scan_jobs so it appears in history (separate from sync)
 		jobsSQL := fmt.Sprintf(`INSERT INTO `+"`%s`"+`.`+"`sync_jobs`"+`
 			(id, src_url, dst_url, start_time, end_time, total_objects, copied_objects, skipped_objects, failed_objects, deleted_objects, total_bytes, status)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, dbSyncJobs)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, dbScanJobs)
 		var endTime interface{}
 		if job.EndTime.IsZero() {
 			endTime = nil

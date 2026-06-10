@@ -286,7 +286,7 @@ func (d *dbDashboard) queryJobs() ([]jobSummary, error) {
 	for _, pair := range [][3]string{
 		{"sync_jobs", "juicefs_sync", "sync"},
 		{"scan_jobs", "scan_sync", "scan"},
-		{"sync_jobs", "single_scan", "scan-single"},
+		{"scan_jobs", "single_scan", "scan-single"},
 	} {
 		rows, err := d.db.Query(
 			fmt.Sprintf("SELECT id, src_url, dst_url, status, start_time, end_time, total_objects, copied_objects, skipped_objects, failed_objects, deleted_objects, total_bytes FROM `%s`.`sync_jobs` ORDER BY start_time DESC LIMIT 50", pair[0]))
