@@ -500,7 +500,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:v
 </div>
 
 <div class="panel active" id="panel-jobs">
-<div class="sub-tabs"><button class="sub-tab active" onclick="filterJobs('all')">All</button><button class="sub-tab" onclick="filterJobs('sync')">Sync</button><button class="sub-tab" onclick="filterJobs('scan')">Scan</button><button class="sub-tab" onclick="filterJobs('scan-single')">Scan Single</button></div>
+<div class="sub-tabs"><button class="sub-tab active" onclick="filterJobs('all',this)">All</button><button class="sub-tab" onclick="filterJobs('sync',this)">Sync</button><button class="sub-tab" onclick="filterJobs('scan',this)">Scan</button><button class="sub-tab" onclick="filterJobs('scan-single',this)">Scan Single</button></div>
 <div class="stats">
 <div class="stat-card c-green"><div class="num" id="stat-total">0</div><div class="label">Total Jobs</div></div>
 <div class="stat-card c-blue"><div class="num" id="stat-copied">0</div><div class="label">Copied</div></div>
@@ -571,7 +571,7 @@ h+='</table>'}}
 document.getElementById('detail-content').innerHTML=h})}
 function closeDetail(){document.getElementById('detail-overlay').classList.remove('show')}
 var jobFilter="all"
-function filterJobs(t){jobFilter=t;document.querySelectorAll('.sub-tab').forEach(b=>b.classList.remove('active'));this.classList.add('active');loadJobs()}
+function filterJobs(t,el){jobFilter=t;document.querySelectorAll('.sub-tab').forEach(b=>b.classList.remove('active'));el.classList.add('active');loadJobs()}
 function loadJobs(){fetch('/api/jobs').then(r=>r.json()).then(data=>{data=data.filter(j=>jobFilter==='all'||j.type===jobFilter);
 var total=0,copied=0,skipped=0,failed=0,html='';
 data.forEach(j=>{total++;copied+=j.copied;skipped+=j.skipped;failed+=j.failed;
