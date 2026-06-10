@@ -122,6 +122,7 @@ func startDBDashboard(db *sql.DB, addr string, dbURL string) {
 	mux.HandleFunc("/api/jobs", d.apiJobs)
 	mux.HandleFunc("/api/job/", d.apiJobRoute)
 	mux.HandleFunc("/api/running", d.apiRunning)
+	mux.HandleFunc("/api/progress/", d.apiJobProgress)
 	mux.HandleFunc("/api/sync", d.apiSync)
 	mux.HandleFunc("/", d.index)
 
@@ -224,6 +225,38 @@ func (d *dbDashboard) apiSync(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/running - list running sync jobs
+
+// GET /api/progress/{jobID} - get realtime progress for a running job
+func (d *dbDashboard) apiJobProgress(w http.ResponseWriter, r *http.Request) {
+	jobID := r.URL.Path[len("/api/progress/"):]
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	for _, pair := range [][2]string{
+		{"sync_jobs", "juicefs_sync"},
+		{"scan_jobs", "scan_sync"},
+	} {
+		tableName := "objects_" + strings.ReplaceAll(strings.ReplaceAll(jobID, "-", "_"), ".", "_")
+		var total int64
+		d.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", pair[1], tableName)).Scan(&total)
+		if total > 0 {
+			rows, _ := d.db.Query(fmt.Sprintf("SELECT status, COUNT(*) FROM %s.%s GROUP BY status", pair[1], tableName))
+			stats := map[string]int64{}
+			for rows.Next() {
+				var st string; var c int64
+				rows.Scan(&st, &c)
+				stats[st] = c
+			}
+			rows.Close()
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"job_id": jobID, "total": total, "stats": stats,
+			})
+			return
+		}
+	}
+	json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+}
+
 func (d *dbDashboard) apiRunning(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -253,6 +286,7 @@ func (d *dbDashboard) queryJobs() ([]jobSummary, error) {
 	for _, pair := range [][3]string{
 		{"sync_jobs", "juicefs_sync", "sync"},
 		{"scan_jobs", "scan_sync", "scan"},
+		{"sync_jobs", "single_scan", "scan-single"},
 	} {
 		rows, err := d.db.Query(
 			fmt.Sprintf("SELECT id, src_url, dst_url, status, start_time, end_time, total_objects, copied_objects, skipped_objects, failed_objects, deleted_objects, total_bytes FROM `%s`.`sync_jobs` ORDER BY start_time DESC LIMIT 50", pair[0]))

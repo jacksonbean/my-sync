@@ -136,8 +136,26 @@ func (s *mysqlService) createObjectsTable(tableName string) error {
 }
 
 func (s *mysqlService) StartJob(job JobInfo) error {
-	// Single scan: skip job record, create simplified table
+	// Single scan: also insert a job record into sync_jobs for history
 	if s.isSingleScan {
+		if err := s.createJobsTable(); err != nil {
+			return fmt.Errorf("create jobs table: %w", err)
+		}
+		// Insert into sync_jobs so it appears in history
+		jobsSQL := fmt.Sprintf(`INSERT INTO `+"`%s`"+`.`+"`sync_jobs`"+`
+			(id, src_url, dst_url, start_time, end_time, total_objects, copied_objects, skipped_objects, failed_objects, deleted_objects, total_bytes, status)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, dbSyncJobs)
+		var endTime interface{}
+		if job.EndTime.IsZero() {
+			endTime = nil
+		} else {
+			endTime = job.EndTime
+		}
+		_, _ = s.db.Exec(jobsSQL,
+			job.ID, job.SrcURL, job.DstURL, job.StartTime, endTime,
+			job.TotalObjects, job.CopiedObjects, job.SkippedObjects, job.FailedObjects, job.DeletedObjects, job.TotalBytes,
+			string(job.Status))
+
 		tableName := "scan_" + strings.ReplaceAll(strings.ReplaceAll(job.ID, "-", "_"), ".", "_")
 		if err := s.createSingleScanTable(tableName); err != nil {
 			return fmt.Errorf("create scan table %s: %w", tableName, err)
