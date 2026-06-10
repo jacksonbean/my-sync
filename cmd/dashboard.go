@@ -394,6 +394,7 @@ const indexHTML = `<!DOCTYPE html>
 <html lang="zh" class="dark">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>JuiceFS Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><rect x=%222%22 y=%226%22 width=%2210%22 height=%2220%22 rx=%222%22 fill=%22%23818cf8%22 opacity=%220.4%22/><rect x=%2220%22 y=%226%22 width=%2210%22 height=%2220%22 rx=%222%22 fill=%22%23818cf8%22 opacity=%220.2%22/><path d=%22M14 16L18 16%22 stroke=%22%23818cf8%22 stroke-width=%222%22 stroke-linecap=%22round%22/><path d=%22M16 13L20 16L16 19%22 stroke=%22%23818cf8%22 stroke-width=%222%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22/></svg>">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);min-height:100vh;--bg:#09090b;--fg:#e4e4e7;--card:#18181b;--border:#27272a;--muted:#71717a;--accent:#a78bfa}body.light{--bg:#fafafa;--fg:#18181b;--card:#fff;--border:#e5e5e5;--muted:#737373;--accent:#7c3aed}}

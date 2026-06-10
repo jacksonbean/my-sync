@@ -62,6 +62,7 @@ const dashboardHTML = `<!DOCTYPE html>
 <html lang="zh" class="dark">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>JuiceFS Sync</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><rect x=%222%22 y=%226%22 width=%2210%22 height=%2220%22 rx=%222%22 fill=%22%23818cf8%22 opacity=%220.4%22/><rect x=%2220%22 y=%226%22 width=%2210%22 height=%2220%22 rx=%222%22 fill=%22%23818cf8%22 opacity=%220.2%22/><path d=%22M14 16L18 16%22 stroke=%22%23818cf8%22 stroke-width=%222%22 stroke-linecap=%22round%22/><path d=%22M16 13L20 16L16 19%22 stroke=%22%23818cf8%22 stroke-width=%222%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22/></svg>">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,-apple-system,sans-serif;background:#09090b;color:#e4e4e7;min-height:100vh}
