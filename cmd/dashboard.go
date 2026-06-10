@@ -441,6 +441,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:v
 .tab{padding:8px 20px;border-radius:8px 8px 0 0;cursor:pointer;font-size:14px;color:var(--muted);background:none;border:none;transition:color .2s}
 .tab.active{color:var(--accent);background:var(--card);border:1px solid var(--border);border-bottom:1px solid #18181b;margin-bottom:-17px}
 .tab:hover{color:var(--fg)}
+.sub-tabs{display:flex;gap:8px;margin-bottom:20px}.sub-tab{padding:6px 16px;border-radius:6px;cursor:pointer;font-size:13px;color:var(--muted);background:var(--card);border:1px solid var(--border);transition:all .2s}.sub-tab.active{background:var(--accent);color:#fff;border-color:var(--accent)}
 .panel{display:none}.panel.active{display:block}
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:32px}
 @media(max-width:640px){.stats{grid-template-columns:repeat(2,1fr)}}
@@ -499,6 +500,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:v
 </div>
 
 <div class="panel active" id="panel-jobs">
+<div class="sub-tabs"><button class="sub-tab active" onclick="filterJobs("all")">All</button><button class="sub-tab" onclick="filterJobs("sync")">Sync</button><button class="sub-tab" onclick="filterJobs("scan")">Scan</button><button class="sub-tab" onclick="filterJobs("scan-single")">Scan Single</button></div>
 <div class="stats">
 <div class="stat-card c-green"><div class="num" id="stat-total">0</div><div class="label">Total Jobs</div></div>
 <div class="stat-card c-blue"><div class="num" id="stat-copied">0</div><div class="label">Copied</div></div>
@@ -568,7 +570,9 @@ d.objects.slice(0,50).forEach(o=>{h+='<tr><td>'+o.key+'</td><td>'+o.size+'</td><
 h+='</table>'}}
 document.getElementById('detail-content').innerHTML=h})}
 function closeDetail(){document.getElementById('detail-overlay').classList.remove('show')}
-function loadJobs(){fetch('/api/jobs').then(r=>r.json()).then(data=>{
+var jobFilter="all"
+function filterJobs(t){jobFilter=t;document.querySelectorAll('.sub-tab').forEach(b=>b.classList.remove('active'));event.target.classList.add('active');loadJobs()}
+function loadJobs(){fetch('/api/jobs').then(r=>r.json()).then(data=>{data=data.filter(j=>jobFilter==='all'||j.type===jobFilter);
 var total=0,copied=0,skipped=0,failed=0,html='';
 data.forEach(j=>{total++;copied+=j.copied;skipped+=j.skipped;failed+=j.failed;
 html+='<div class="job-card" onclick="openDetail(\''+j.id+'\')"><div class="job-header"><span class="job-id">'+j.id+'</span><span class="job-status status-'+j.status+'">'+j.status+'</span></div><div class="job-paths"><span>'+short(j.source)+'</span> &#10142; <span>'+short(j.dest)+'</span></div><div class="progress"><div class="progress-fill '+(j.status=='failed'?'progress-fail':'progress-ok')+'" style="width:'+(j.percent||0)+'%"></div></div><div class="job-meta"><span>Total: <b>'+j.total+'</b></span><span>Copied: <b>'+j.copied+'</b></span><span>Skipped: <b>'+j.skipped+'</b></span><span>Failed: <b>'+j.failed+'</b></span><span>Bytes: <b>'+j.bytes_fmt+'</b></span><span>'+timeFmt(j.start_time)+'</span></div></div>'});
