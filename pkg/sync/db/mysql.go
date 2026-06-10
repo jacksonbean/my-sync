@@ -11,11 +11,12 @@ import (
 )
 
 const (
-	dbSyncJobs   = "sync_jobs"
-	dbSyncData   = "juicefs_sync"
-	dbScanJobs   = "scan_jobs"
-	dbScanData   = "scan_sync"
-	dbSingleScan = "single_scan"
+	dbSyncJobs       = "sync_jobs"
+	dbSyncData       = "juicefs_sync"
+	dbScanJobs       = "scan_jobs"
+	dbScanData       = "scan_sync"
+	dbSingleScanJobs = "single_scan_jobs"
+	dbSingleScan     = "single_scan"
 )
 
 // mysqlService implements DbService backed by MySQL with separate databases for jobs and data.
@@ -55,7 +56,7 @@ func NewMySQLService(cfg *DbConfig, isScan, isSingleScan bool) (DbService, error
 }
 
 func (s *mysqlService) createDatabases() error {
-	dbs := []string{dbSyncJobs, dbSyncData, dbScanJobs, dbScanData, dbSingleScan}
+	dbs := []string{dbSyncJobs, dbSyncData, dbScanJobs, dbScanData, dbSingleScanJobs, dbSingleScan}
 	for _, name := range dbs {
 		if _, err := s.db.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", name)); err != nil {
 			return fmt.Errorf("create database %s: %w", name, err)
@@ -65,6 +66,9 @@ func (s *mysqlService) createDatabases() error {
 }
 
 func (s *mysqlService) jobsDB() string {
+	if s.isSingleScan {
+		return dbSingleScanJobs
+	}
 	if s.isScan {
 		return dbScanJobs
 	}
