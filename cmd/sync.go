@@ -205,6 +205,10 @@ func syncActionFlags() []cli.Flag {
 			Name:  "scan-single",
 			Usage: "scan a single bucket and record object metadata to --db via ListObjects only (no Head calls)",
 		},
+		&cli.BoolFlag{
+			Name:  "double-check",
+			Usage: "run a second pass after sync to catch objects added during migration",
+		},
 		&cli.StringFlag{
 			Name:  "output",
 			Usage: "output scan results to CSV file (use with --scan or --scan-single)",

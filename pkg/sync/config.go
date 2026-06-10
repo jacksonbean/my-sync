@@ -83,6 +83,7 @@ type Config struct {
 	ScanSingle           bool
 	OutputFile           string
 	Dashboard            string
+	DoubleCheck          bool
 
 	rules          []rule
 	concurrentList chan int              `json:"-"`
@@ -233,6 +234,7 @@ func NewConfigFromCli(c *cli.Context) *Config {
 		ScanSingle:           c.Bool("scan-single"),
 		OutputFile:           c.String("output"),
 		Dashboard:            c.String("dashboard"),
+		DoubleCheck:          c.Bool("double-check"),
 		Env:                  make(map[string]string),
 	}
 	if !c.IsSet("max-size") {

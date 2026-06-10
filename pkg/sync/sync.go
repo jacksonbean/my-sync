@@ -201,6 +201,7 @@ var syncSrc object.ObjectStorage    // source storage for Head in recordSyncObje
 var srcMetaCache sync.Map          // key → object.ObjectMeta, cache from copy paths
 var outputCSV *csv.Writer
 var outputCSVFile *os.File
+var doubleCheckPass int            // 0 = first pass, 1 = second pass
 
 func incrTotal(n int64) {
 	totalHandled.Add(n)
@@ -2776,7 +2777,41 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		}()
 		delWg.Wait()
 	}
+	// Double check: second pass to catch objects added during first pass
+	if config.DoubleCheck && doubleCheckPass == 0 {
+		doubleCheckPass = 1
+		logger.Infof("Running double-check pass...")
+		_ = doubleCheckPass0(src, dst)
+	}
 	return syncExitFunc()
+}
+
+func doubleCheckPass0(src, dst object.ObjectStorage) error {
+	srcObjects, err := listAll(src, "", "", "", true, true)
+	if err != nil {
+		return err
+	}
+	var copied, skipped int64
+	startTime := time.Now()
+	for obj := range srcObjects {
+		if obj == nil {
+			break
+		}
+		key := obj.Key()
+		dstObj, dstErr := dst.Head(ctx, key)
+		if dstErr == nil && dstObj.Size() == obj.Size() {
+			skipped++
+			continue
+		}
+		_, err := copyData(src, dst, key, obj.Size(), obj.Mtime(), false, nil)
+		if err != nil {
+			logger.Errorf("Double-check: failed to copy %s: %v", key, err)
+		} else {
+			copied++
+		}
+	}
+	logger.Infof("Double-check complete: copied %d, skipped %d in %s", copied, skipped, time.Since(startTime))
+	return nil
 }
 
 func initSyncMetrics(config *Config) {

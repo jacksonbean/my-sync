@@ -120,7 +120,7 @@ func startDBDashboard(db *sql.DB, addr string, dbURL string) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/jobs", d.apiJobs)
-	mux.HandleFunc("/api/job/", d.apiJobDetail)
+	mux.HandleFunc("/api/job/", d.apiJobRoute)
 	mux.HandleFunc("/api/running", d.apiRunning)
 	mux.HandleFunc("/api/sync", d.apiSync)
 	mux.HandleFunc("/", d.index)
@@ -292,6 +292,47 @@ func (d *dbDashboard) apiJobs(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(jobs)
 }
 
+func (d *dbDashboard) apiJobRoute(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	if strings.HasSuffix(path, "/csv") {
+		d.apiJobCSV(w, r)
+		return
+	}
+	d.apiJobDetail(w, r)
+}
+
+func (d *dbDashboard) apiJobCSV(w http.ResponseWriter, r *http.Request) {
+	jobID := strings.TrimSuffix(r.URL.Path[len("/api/job/"):], "/csv")
+	for _, dbName := range []string{"juicefs_sync", "scan_sync", "single_scan"} {
+		tableName := "objects_" + strings.ReplaceAll(strings.ReplaceAll(jobID, "-", "_"), ".", "_")
+		var count int
+		d.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", dbName, tableName)).Scan(&count)
+		if count > 0 {
+			rows, _ := d.db.Query(fmt.Sprintf("SELECT source_key, size, content_type, status, error_msg, start_time, end_time FROM `%s`.`%s`", dbName, tableName))
+			w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s.csv", tableName))
+			fmt.Fprintln(w, "source_key,size,content_type,status,error_msg,start_time,end_time")
+			for rows.Next() {
+				var key, ct, st, msg string
+				var sz int64
+				var start, end sql.NullTime
+				rows.Scan(&key, &sz, &ct, &st, &msg, &start, &end)
+				fmt.Fprintf(w, "%q,%d,%q,%q,%q,%q,%q\n", key, sz, ct, st, msg, fmtTime(start), fmtTime(end))
+			}
+			rows.Close()
+			return
+		}
+	}
+	http.Error(w, "not found", 404)
+}
+
+func fmtTime(t sql.NullTime) string {
+	if t.Valid {
+		return t.Time.Format("2006-01-02 15:04:05")
+	}
+	return ""
+}
+
 func (d *dbDashboard) apiJobDetail(w http.ResponseWriter, r *http.Request) {
 	jobID := r.URL.Path[len("/api/job/"):]
 	w.Header().Set("Content-Type", "application/json")
@@ -327,7 +368,7 @@ func (d *dbDashboard) apiJobDetail(w http.ResponseWriter, r *http.Request) {
 			objRows.Close()
 
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"job_id": jobID, "db": dbName, "stats": stats, "objects": objects,
+				"job_id": jobID, "db": dbName, "stats": stats, "objects": objects, "total_objects": count,
 			})
 			return
 		}
@@ -355,46 +396,46 @@ const indexHTML = `<!DOCTYPE html>
 <title>JuiceFS Dashboard</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui,-apple-system,sans-serif;background:#09090b;color:#e4e4e7;min-height:100vh}
-.bg{position:fixed;inset:0;z-index:0;background:radial-gradient(ellipse 80% 50% at 50% -20%,rgba(120,119,198,0.12),transparent)}
+body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);min-height:100vh;--bg:#09090b;--fg:#e4e4e7;--card:#18181b;--border:#27272a;--muted:#71717a;--accent:#a78bfa}body.light{--bg:#fafafa;--fg:#18181b;--card:#fff;--border:#e5e5e5;--muted:#737373;--accent:#7c3aed}}
+.bg{position:fixed;inset:0;z-index:0;background:radial-gradient(ellipse 80% 50% at 50% -20%,var(--glow),transparent)}body{--glow:rgba(120,119,198,0.12)}body.light{--glow:rgba(120,119,198,0.04)}
 .container{position:relative;z-index:1;max-width:1100px;margin:0 auto;padding:40px 24px}
 .header{text-align:center;margin-bottom:48px}
 .header h1{font-size:28px;font-weight:700;background:linear-gradient(135deg,#818cf8,#a78bfa,#f472b6);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.header p{color:#71717a;margin-top:8px;font-size:14px}
+.header p{color:var(--muted);margin-top:8px;font-size:14px}
 .tabs{display:flex;gap:8px;margin-bottom:32px;border-bottom:1px solid #27272a;padding-bottom:16px}
-.tab{padding:8px 20px;border-radius:8px 8px 0 0;cursor:pointer;font-size:14px;color:#71717a;background:none;border:none;transition:color .2s}
-.tab.active{color:#a78bfa;background:#18181b;border:1px solid #27272a;border-bottom:1px solid #18181b;margin-bottom:-17px}
-.tab:hover{color:#e4e4e7}
+.tab{padding:8px 20px;border-radius:8px 8px 0 0;cursor:pointer;font-size:14px;color:var(--muted);background:none;border:none;transition:color .2s}
+.tab.active{color:var(--accent);background:var(--card);border:1px solid var(--border);border-bottom:1px solid #18181b;margin-bottom:-17px}
+.tab:hover{color:var(--fg)}
 .panel{display:none}.panel.active{display:block}
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:32px}
 @media(max-width:640px){.stats{grid-template-columns:repeat(2,1fr)}}
-.stat-card{background:#18181b;border:1px solid #27272a;border-radius:12px;padding:20px;text-align:center}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;text-align:center}
 .stat-card .num{font-size:28px;font-weight:700}
-.stat-card .label{margin-top:6px;color:#a1a1aa;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+.stat-card .label{margin-top:6px;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
 .c-green .num{color:#22c55e}.c-yellow .num{color:#eab308}.c-red .num{color:#ef4444}.c-blue .num{color:#3b82f6}
-.job-card{background:#18181b;border:1px solid #27272a;border-radius:12px;padding:20px;margin-bottom:16px;cursor:pointer;transition:border-color .2s,transform .2s}
+.job-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:16px;cursor:pointer;transition:border-color .2s,transform .2s}
 .job-card:hover{border-color:#3f3f46;transform:translateY(-1px)}
 .job-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
-.job-id{font-size:14px;font-weight:600;color:#a78bfa}
+.job-id{font-size:14px;font-weight:600;color:var(--accent)}
 .job-status{padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;text-transform:uppercase}
 .status-completed{background:#052e16;color:#22c55e}.status-running{background:#1e3a5f;color:#3b82f6;animation:pulse 2s infinite}
 .status-failed{background:#450a0a;color:#ef4444}
-.type-badge{padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase;margin-right:8px}.type-sync{background:#1e3a5f;color:#3b82f6}.type-scan{background:#1e2a1e;color:#22c55e}.type-scan-single{background:#2a1e3a;color:#a78bfa}
+.type-badge{padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase;margin-right:8px}.type-sync{background:#1e3a5f;color:#3b82f6}.type-scan{background:#1e2a1e;color:#22c55e}.type-scan-single{background:#2a1e3a;color:var(--accent)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
-.job-paths{font-size:12px;color:#71717a;margin-bottom:12px;display:flex;gap:12px}
-.job-paths span{color:#a1a1aa}
+.job-paths{font-size:12px;color:var(--muted);margin-bottom:12px;display:flex;gap:12px}
+.job-paths span{color:var(--muted)}
 .progress{height:6px;background:#27272a;border-radius:4px;overflow:hidden;margin-bottom:12px}
 .progress-fill{height:100%;border-radius:4px;transition:width .5s}
 .progress-ok{background:linear-gradient(90deg,#6366f1,#8b5cf6)}.progress-fail{background:linear-gradient(90deg,#ef4444,#f97316)}
-.job-meta{display:flex;gap:24px;font-size:12px;color:#71717a}
-.job-meta b{color:#e4e4e7}
-.time{text-align:center;color:#52525b;font-size:12px;margin-top:32px}
+.job-meta{display:flex;gap:24px;font-size:12px;color:var(--muted)}
+.job-meta b{color:var(--fg)}
+.time{text-align:center;color:var(--muted);font-size:12px;margin-top:32px}
 .form-group{margin-bottom:16px}
-.form-group label{display:block;font-size:13px;color:#a1a1aa;margin-bottom:6px}
-.form-group input{width:100%;padding:10px 14px;background:#18181b;border:1px solid #27272a;border-radius:8px;color:#e4e4e7;font-size:14px;outline:none;transition:border-color .2s}
+.form-group label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
+.form-group input{width:100%;padding:10px 14px;background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--fg);font-size:14px;outline:none;transition:border-color .2s}
 .form-group input:focus{border-color:#6366f1}
-.form-section{margin-bottom:24px}.form-label{font-size:13px;color:#a1a1aa;margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px}
-.mode-selector{display:flex;gap:12px}.mode-option{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;padding:16px 12px;background:#18181b;border:1px solid #27272a;border-radius:10px;cursor:pointer;transition:border-color .2s}.mode-option:hover{border-color:#3f3f46}.mode-option input[type=radio]{display:none}.mode-option:has(input:checked){border-color:#6366f1;background:#1e1b3a}.mode-text{font-size:15px;font-weight:600;color:#e4e4e7}.mode-desc{font-size:11px;color:#71717a}.checkbox-grid{display:flex;gap:20px}.check-label{display:flex;align-items:center;gap:6px;font-size:14px;color:#a1a1aa;cursor:pointer}.check-label input[type=checkbox]{accent-color:#6366f1;width:16px;height:16px}
+.form-section{margin-bottom:24px}.form-label{font-size:13px;color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px}
+.mode-selector{display:flex;gap:12px}.mode-option{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;padding:16px 12px;background:var(--card);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color .2s}.mode-option:hover{border-color:#3f3f46}.mode-option input[type=radio]{display:none}.mode-option:has(input:checked){border-color:#6366f1;background:#1e1b3a}.mode-text{font-size:15px;font-weight:600;color:var(--fg)}.mode-desc{font-size:11px;color:var(--muted)}.checkbox-grid{display:flex;gap:20px}.check-label{display:flex;align-items:center;gap:6px;font-size:14px;color:var(--muted);cursor:pointer}.check-label input[type=checkbox]{accent-color:#6366f1;width:16px;height:16px}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .btn{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;background:linear-gradient(135deg,#6366f1,#8b5cf6);border:none;border-radius:8px;color:#fff;font-size:15px;font-weight:600;cursor:pointer;transition:opacity .2s}
 .btn:hover{opacity:.9}
@@ -406,16 +447,16 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#09090b;color:#e4
 .running-dot{width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;margin-right:6px}
 .detail-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:10;justify-content:center;align-items:center}
 .detail-overlay.show{display:flex}
-.detail-panel{background:#18181b;border:1px solid #27272a;border-radius:16px;padding:32px;max-width:700px;width:90%;max-height:80vh;overflow-y:auto}
-.detail-panel h2{color:#a78bfa;margin-bottom:20px}
-.detail-close{float:right;background:none;border:none;color:#71717a;font-size:24px;cursor:pointer}
+.detail-panel{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:32px;max-width:700px;width:90%;max-height:80vh;overflow-y:auto}
+.detail-panel h2{color:var(--accent);margin-bottom:20px}
+.detail-close{float:right;background:none;border:none;color:var(--muted);font-size:24px;cursor:pointer}
 .detail-table{width:100%;border-collapse:collapse;font-size:13px}
 .detail-table th,.detail-table td{border:1px solid #27272a;padding:8px 12px;text-align:left}
-.detail-table th{background:#09090b;color:#a1a1aa}
+.detail-table th{background:#09090b;color:var(--muted)}
 </style></head><body>
 <div class="bg"></div>
 <div class="container">
-<div class="header"><h1>&#128202; JuiceFS Sync Dashboard</h1><p>Migration control center</p></div>
+<div class="header"><h1>&#128202; JuiceFS Sync Dashboard</h1><p>Migration control center</p><button onclick="toggleTheme()" class="theme-btn" title="Toggle theme">&#9788;&#65039;</button></div>
 <div class="tabs">
 <button class="tab active" onclick="switchTab('jobs')">History</button>
 <button class="tab" onclick="switchTab('new-task')">New Task</button>
@@ -446,7 +487,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#09090b;color:#e4
 </div>
 
 <div class="panel" id="panel-running">
-<div id="running-list"><div style="text-align:center;color:#71717a;padding:40px">No running sync jobs</div></div>
+<div id="running-list"><div style="text-align:center;color:var(--muted);padding:40px">No running sync jobs</div></div>
 </div>
 
 <div class="time" id="footer"></div>
@@ -479,7 +520,7 @@ else{toast(d.error,false)}
 function loadRunning(){fetch('/api/running').then(r=>r.json()).then(data=>{
 var h='';
 data.forEach(j=>{h+='<div class="job-card"><div class="job-header"><span class="job-id"><span class="running-dot"></span>'+j.id+'</span><span class="job-status status-running">running</span></div><div class="job-paths"><span>'+j.src_url+'</span> → <span>'+j.dst_url+'</span></div><div class="job-meta"><span>PID: <b>'+j.pid+'</b></span><span>Started: <b>'+new Date(j.start_time).toLocaleString()+'</b></span></div></div>'});
-document.getElementById('running-list').innerHTML=h||'<div style="text-align:center;color:#71717a;padding:40px">No running sync jobs</div>'})}
+document.getElementById('running-list').innerHTML=h||'<div style="text-align:center;color:var(--muted);padding:40px">No running sync jobs</div>'})}
 function openDetail(id){document.getElementById('detail-overlay').classList.add('show');document.getElementById('detail-content').innerHTML='Loading...';
 fetch('/api/job/'+id).then(r=>r.json()).then(d=>{
 var h='<h2>'+id+'</h2>';
@@ -487,7 +528,7 @@ if(d.error){h+=d.error}else{
 h+='<table class="detail-table"><tr><th>Status</th><th>Count</th><th>Bytes</th></tr>';
 (d.stats||[]).forEach(s=>{h+='<tr><td>'+s.status+'</td><td>'+s.count+'</td><td>'+s.bytes+'</td></tr>'});
 h+='</table>';
-if(d.objects){h+='<h3 style="margin-top:16px;color:#a1a1aa">Sample Objects</h3><table class="detail-table"><tr><th>Key</th><th>Size</th><th>Content-Type</th></tr>';
+h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:16px"><h3 style="color:var(--muted);margin:0">Objects '+(d.total_objects>100?'(showing 100 of '+d.total_objects+')':'('+d.total_objects+' total)')+'</h3><a href="/api/job/'+id+'/csv" class="btn" style="padding:6px 12px;font-size:12px;text-decoration:none">Download CSV</a></div>';if(d.objects){h+='<table class="detail-table"><tr><th>Key</th><th>Size</th><th>Content-Type</th></tr>';
 d.objects.slice(0,50).forEach(o=>{h+='<tr><td>'+o.key+'</td><td>'+o.size+'</td><td>'+(o.content_type||'')+'</td></tr>'});
 h+='</table>'}}
 document.getElementById('detail-content').innerHTML=h})}
@@ -496,13 +537,14 @@ function loadJobs(){fetch('/api/jobs').then(r=>r.json()).then(data=>{
 var total=0,copied=0,skipped=0,failed=0,html='';
 data.forEach(j=>{total++;copied+=j.copied;skipped+=j.skipped;failed+=j.failed;
 html+='<div class="job-card" onclick="openDetail(\''+j.id+'\')"><div class="job-header"><span class="job-id">'+j.id+'</span><span class="job-status status-'+j.status+'">'+j.status+'</span></div><div class="job-paths"><span>'+short(j.source)+'</span> &#10142; <span>'+short(j.dest)+'</span></div><div class="progress"><div class="progress-fill '+(j.status=='failed'?'progress-fail':'progress-ok')+'" style="width:'+(j.percent||0)+'%"></div></div><div class="job-meta"><span>Total: <b>'+j.total+'</b></span><span>Copied: <b>'+j.copied+'</b></span><span>Skipped: <b>'+j.skipped+'</b></span><span>Failed: <b>'+j.failed+'</b></span><span>Bytes: <b>'+j.bytes_fmt+'</b></span><span>'+timeFmt(j.start_time)+'</span></div></div>'});
-document.getElementById('job-list').innerHTML=html||'<div style="text-align:center;color:#71717a;padding:40px">No jobs yet</div>';
+document.getElementById('job-list').innerHTML=html||'<div style="text-align:center;color:var(--muted);padding:40px">No jobs yet</div>';
 document.getElementById('stat-total').textContent=total;
 document.getElementById('stat-copied').textContent=copied;
 document.getElementById('stat-skipped').textContent=skipped;
 document.getElementById('stat-failed').textContent=failed;
 document.getElementById('footer').textContent='Updated: '+new Date().toLocaleTimeString()})}
 function toggleDst(){var m=document.querySelector('input[name="mode"]:checked').value;document.getElementById('dst-group').style.display=m=='scan-single'?'none':'block'}
+function toggleTheme(){document.body.classList.toggle("light");localStorage.setItem("theme",document.body.classList.contains("light")?"light":"dark")}if(localStorage.getItem("theme")==="light")document.body.classList.add("light")
 function short(s){if(!s)return'';var i=s.indexOf('://');var t=i>0?s.substring(i+3):s;return t.length>40?t.substring(0,40)+'...':t}
 function timeFmt(t){if(!t)return'';return new Date(t).toLocaleString()}
 loadJobs();setInterval(loadJobs,10000);setInterval(loadRunning,5000);
