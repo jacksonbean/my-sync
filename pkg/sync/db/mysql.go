@@ -148,17 +148,19 @@ func (s *mysqlService) StartJob(job JobInfo) error {
 		// Insert into scan_jobs so it appears in history (separate from sync)
 		jobsSQL := fmt.Sprintf(`INSERT INTO `+"`%s`"+`.`+"`sync_jobs`"+`
 			(id, src_url, dst_url, start_time, end_time, total_objects, copied_objects, skipped_objects, failed_objects, deleted_objects, total_bytes, status)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, dbScanJobs)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.jobsDB())
 		var endTime interface{}
 		if job.EndTime.IsZero() {
 			endTime = nil
 		} else {
 			endTime = job.EndTime
 		}
-		_, _ = s.db.Exec(jobsSQL,
+		if _, err := s.db.Exec(jobsSQL,
 			job.ID, job.SrcURL, job.DstURL, job.StartTime, endTime,
 			job.TotalObjects, job.CopiedObjects, job.SkippedObjects, job.FailedObjects, job.DeletedObjects, job.TotalBytes,
-			string(job.Status))
+			string(job.Status)); err != nil {
+			return fmt.Errorf("insert job record: %w", err)
+		}
 
 		tableName := "scan_" + strings.ReplaceAll(strings.ReplaceAll(job.ID, "-", "_"), ".", "_")
 		if err := s.createSingleScanTable(tableName); err != nil {

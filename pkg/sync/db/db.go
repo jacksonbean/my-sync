@@ -132,7 +132,7 @@ func ParseDbDSN(raw string) (*DbConfig, error) {
 }
 
 // channelSize is the buffer size for the object record channel.
-const channelSize = 2048
+const channelSize = 50000
 
 // batchSize is the number of records to accumulate before flushing to DB.
 const batchSize = 100

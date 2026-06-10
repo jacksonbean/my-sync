@@ -2185,6 +2185,14 @@ func scanSingle(src object.ObjectStorage) error {
 	logger.Infof("Single scan complete: %d objects in %s", total, time.Since(startTime))
 
 	_ = syncDbService.Close()
+	if syncDbService != nil {
+		_ = syncDbService.EndJob(syncDbJobID, sync_db.JobInfo{
+			ID:          syncDbJobID,
+			Status:      sync_db.JobCompleted,
+			EndTime:     time.Now(),
+			TotalObjects: total,
+		})
+	}
 	return nil
 }
 
