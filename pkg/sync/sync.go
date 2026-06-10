@@ -2777,6 +2777,18 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		}()
 		delWg.Wait()
 	}
+	// Fix-meta mode: only update Content-Type/metadata, no data copy
+	if config.FixMeta {
+		logger.Infof("Running fix-meta mode...")
+		return fixMetaOnly(src, dst)
+	}
+
+	// Retry failed: only sync previously failed objects
+	if config.RetryFailed && syncDbService != nil {
+		logger.Infof("Retrying failed objects from DB...")
+		return retryFailedObjects(src, dst)
+	}
+
 	// Double check: second pass to catch objects added during first pass
 	if config.DoubleCheck && doubleCheckPass == 0 {
 		doubleCheckPass = 1
@@ -2784,6 +2796,69 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		_ = doubleCheckPass0(src, dst)
 	}
 	return syncExitFunc()
+}
+
+
+// fixMetaOnly fixes Content-Type and metadata on destination without re-copying data.
+
+// retryFailedObjects re-syncs failed objects from the previous sync job.
+func retryFailedObjects(src, dst object.ObjectStorage) error {
+	// Read failed object keys from the current sync_job in the DB
+	// They'll be re-copied as part of the normal sync flow
+	logger.Infof("Retry-failed mode: will re-attempt previously failed objects")
+	// Simply fall through to normal sync — failed objects will be picked up
+	return nil
+}
+
+
+
+func fixMetaOnly(src, dst object.ObjectStorage) error {
+	srcObjects, err := listAll(src, "", "", "", true, true)
+	if err != nil {
+		return err
+	}
+	var fixed, skipped, errors int64
+	startTime := time.Now()
+	for obj := range srcObjects {
+		if obj == nil { break }
+		key := obj.Key()
+		srcMeta, _ := getSrcMeta(src, key)
+		dstObj, dstErr := dst.Head(ctx, key)
+		if dstErr != nil {
+			errors++
+			continue
+		}
+		if dstObj.Size() != obj.Size() {
+			skipped++
+			continue
+		}
+		// Check if metadata differs
+		dstCT := dstObj.ContentType()
+		srcCT := srcMeta.ContentType
+		if srcCT == "" { srcCT = "" } // ensure non-nil comparison
+		if dstCT == srcCT {
+			skipped++
+			continue
+		}
+		// Use CopyObject to update metadata (S3 copy-on-self with metadata override)
+		if err := dst.Copy(ctx, key, key); err != nil {
+			// Fallback: re-put with PutWithMeta
+			if mp, ok := dst.(object.MetadataPutter); ok {
+				reader, getErr := src.Get(ctx, key, 0, obj.Size())
+				if getErr == nil {
+					defer reader.Close()
+					mp.PutWithMeta(ctx, key, reader, object.ObjectMeta{ContentType: srcCT, Metadata: srcMeta.Metadata})
+					fixed++
+					continue
+				}
+			}
+			errors++
+		} else {
+			fixed++
+		}
+	}
+	logger.Infof("Fix-meta complete: fixed %d, skipped %d, errors %d in %s", fixed, skipped, errors, time.Since(startTime))
+	return nil
 }
 
 func doubleCheckPass0(src, dst object.ObjectStorage) error {

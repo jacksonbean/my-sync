@@ -400,7 +400,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:v
 .bg{position:fixed;inset:0;z-index:0;background:radial-gradient(ellipse 80% 50% at 50% -20%,var(--glow),transparent)}body{--glow:rgba(120,119,198,0.12)}body.light{--glow:rgba(120,119,198,0.04)}
 .container{position:relative;z-index:1;max-width:1100px;margin:0 auto;padding:40px 24px}
 .header{text-align:center;margin-bottom:48px}
-.header h1{font-size:28px;font-weight:700;background:linear-gradient(135deg,#818cf8,#a78bfa,#f472b6);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.logo{margin-bottom:16px}.header h1{font-size:28px;font-weight:700;background:linear-gradient(135deg,#818cf8,#a78bfa,#f472b6);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .header p{color:var(--muted);margin-top:8px;font-size:14px}
 .tabs{display:flex;gap:8px;margin-bottom:32px;border-bottom:1px solid #27272a;padding-bottom:16px}
 .tab{padding:8px 20px;border-radius:8px 8px 0 0;cursor:pointer;font-size:14px;color:var(--muted);background:none;border:none;transition:color .2s}
@@ -435,7 +435,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:v
 .form-group input{width:100%;padding:10px 14px;background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--fg);font-size:14px;outline:none;transition:border-color .2s}
 .form-group input:focus{border-color:#6366f1}
 .form-section{margin-bottom:24px}.form-label{font-size:13px;color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px}
-.mode-selector{display:flex;gap:12px}.mode-option{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;padding:16px 12px;background:var(--card);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color .2s}.mode-option:hover{border-color:#3f3f46}.mode-option input[type=radio]{display:none}.mode-option:has(input:checked){border-color:#6366f1;background:#1e1b3a}.mode-text{font-size:15px;font-weight:600;color:var(--fg)}.mode-desc{font-size:11px;color:var(--muted)}.checkbox-grid{display:flex;gap:20px}.check-label{display:flex;align-items:center;gap:6px;font-size:14px;color:var(--muted);cursor:pointer}.check-label input[type=checkbox]{accent-color:#6366f1;width:16px;height:16px}
+.mode-selector{display:flex;gap:12px}.mode-option{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;padding:16px 12px;background:var(--card);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color .2s}.mode-option:hover{border-color:#3f3f46}.mode-option input[type=radio]{display:none}.mode-option:has(input:checked){border-color:var(--accent);background:var(--accent)}.mode-option:has(input:checked) .mode-text,.mode-option:has(input:checked) .mode-desc{color:#fff}.mode-text{font-size:15px;font-weight:600;color:var(--fg)}.mode-desc{font-size:11px;color:var(--muted)}.checkbox-grid{display:flex;gap:20px}.check-label{display:flex;align-items:center;gap:6px;font-size:14px;color:var(--muted);cursor:pointer}.check-label input[type=checkbox]{accent-color:#6366f1;width:16px;height:16px}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .btn{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;background:linear-gradient(135deg,#6366f1,#8b5cf6);border:none;border-radius:8px;color:#fff;font-size:15px;font-weight:600;cursor:pointer;transition:opacity .2s}
 .btn:hover{opacity:.9}
@@ -456,7 +456,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:v
 </style></head><body>
 <div class="bg"></div>
 <div class="container">
-<div class="header"><h1>&#128202; JuiceFS Sync Dashboard</h1><p>Migration control center</p><button onclick="toggleTheme()" class="theme-btn" title="Toggle theme">&#9788;&#65039;</button></div>
+<div class="header"><div class="logo"><svg width="48" height="48" viewBox="0 0 48 48" fill="none"><rect x="2" y="8" width="16" height="32" rx="3" fill="var(--accent)" opacity="0.3" stroke="var(--accent)" stroke-width="2"/><rect x="30" y="8" width="16" height="32" rx="3" fill="var(--accent)" opacity="0.15" stroke="var(--accent)" stroke-width="2"/><path d="M20 24L28 24" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round"/><path d="M25 20L29 24L25 28" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="18" r="3" fill="var(--accent)" opacity="0.5"/><circle cx="12" cy="30" r="3" fill="var(--accent)" opacity="0.5"/><circle cx="38" cy="18" r="3" fill="var(--accent)" opacity="0.5"/><circle cx="38" cy="30" r="3" fill="var(--accent)" opacity="0.5"/></svg></div><h1>JuiceFS Sync Dashboard</h1><p>Migration control center</p><button onclick="toggleTheme()" class="theme-btn" title="Toggle theme">&#9788;&#65039;</button></div>
 <div class="tabs">
 <button class="tab active" onclick="switchTab('jobs')">History</button>
 <button class="tab" onclick="switchTab('new-task')">New Task</button>

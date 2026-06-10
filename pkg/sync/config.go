@@ -84,6 +84,8 @@ type Config struct {
 	OutputFile           string
 	Dashboard            string
 	DoubleCheck          bool
+	FixMeta              bool
+	RetryFailed          bool
 
 	rules          []rule
 	concurrentList chan int              `json:"-"`
@@ -235,6 +237,8 @@ func NewConfigFromCli(c *cli.Context) *Config {
 		OutputFile:           c.String("output"),
 		Dashboard:            c.String("dashboard"),
 		DoubleCheck:          c.Bool("double-check"),
+		FixMeta:              c.Bool("fix-meta"),
+		RetryFailed:         c.Bool("retry-failed"),
 		Env:                  make(map[string]string),
 	}
 	if !c.IsSet("max-size") {

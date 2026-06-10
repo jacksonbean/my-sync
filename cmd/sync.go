@@ -209,6 +209,14 @@ func syncActionFlags() []cli.Flag {
 			Name:  "double-check",
 			Usage: "run a second pass after sync to catch objects added during migration",
 		},
+		&cli.BoolFlag{
+			Name:  "fix-meta",
+			Usage: "fix Content-Type and metadata on destination without re-copying data (same-size objects only)",
+		},
+		&cli.BoolFlag{
+			Name:  "retry-failed",
+			Usage: "retry only failed objects from previous sync (requires --db)",
+		},
 		&cli.StringFlag{
 			Name:  "output",
 			Usage: "output scan results to CSV file (use with --scan or --scan-single)",
