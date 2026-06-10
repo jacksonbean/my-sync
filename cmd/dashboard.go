@@ -341,6 +341,10 @@ func (d *dbDashboard) apiJobCSV(w http.ResponseWriter, r *http.Request) {
 		tableName := "objects_" + strings.ReplaceAll(strings.ReplaceAll(jobID, "-", "_"), ".", "_")
 		var count int
 		d.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", dbName, tableName)).Scan(&count)
+		if count == 0 {
+			tableName = "scan_" + strings.ReplaceAll(strings.ReplaceAll(jobID, "-", "_"), ".", "_")
+			d.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", dbName, tableName)).Scan(&count)
+		}
 		if count > 0 {
 			rows, _ := d.db.Query(fmt.Sprintf("SELECT source_key, size, content_type, status, error_msg, start_time, end_time FROM `%s`.`%s`", dbName, tableName))
 			w.Header().Set("Content-Type", "text/csv; charset=utf-8")
@@ -376,7 +380,15 @@ func (d *dbDashboard) apiJobDetail(w http.ResponseWriter, r *http.Request) {
 		tableName := "objects_" + strings.ReplaceAll(strings.ReplaceAll(jobID, "-", "_"), ".", "_")
 		var count int
 		d.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", dbName, tableName)).Scan(&count)
+		if count == 0 {
+			tableName = "scan_" + strings.ReplaceAll(strings.ReplaceAll(jobID, "-", "_"), ".", "_")
+			d.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", dbName, tableName)).Scan(&count)
+		}
 		if count > 0 {
+			if dbName == "single_scan" {
+				json.NewEncoder(w).Encode(map[string]interface{}{"job_id": jobID, "db": dbName, "total_objects": count})
+				return
+			}
 			rows, _ := d.db.Query(fmt.Sprintf("SELECT status, COUNT(*), SUM(size) FROM `%s`.`%s` GROUP BY status", dbName, tableName))
 			var stats []map[string]interface{}
 			for rows.Next() {
