@@ -141,6 +141,7 @@ func (d *dbDashboard) apiSync(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Src           string `json:"src"`
 		Dst           string `json:"dst"`
+		Mode          string `json:"mode"`
 		Threads       int    `json:"threads"`
 		PreserveMeta  bool   `json:"preserve_meta"`
 		NoHttps       bool   `json:"no_https"`
@@ -148,14 +149,22 @@ func (d *dbDashboard) apiSync(w http.ResponseWriter, r *http.Request) {
 		DeleteDst     bool   `json:"delete_dst"`
 	}
 	json.Unmarshal(body, &req)
-	if req.Src == "" || req.Dst == "" {
+	if req.Mode == "" {
+		req.Mode = "sync"
+	}
+	if req.Src == "" {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"error": "src and dst required"})
+		json.NewEncoder(w).Encode(map[string]string{"error": "src required"})
 		return
 	}
 
-	// Build command
+	// Build command (all modes use the "sync" subcommand with mode flags)
 	args := []string{"sync"}
+	if req.Mode == "scan" {
+		args = append(args, "--scan")
+	} else if req.Mode == "scan-single" {
+		args = append(args, "--scan-single")
+	}
 	if req.NoHttps {
 		args = append(args, "--no-https")
 	}
@@ -174,7 +183,11 @@ func (d *dbDashboard) apiSync(w http.ResponseWriter, r *http.Request) {
 	if d.dbURL != "" {
 		args = append(args, "--db", d.dbURL)
 	}
-	args = append(args, req.Src, req.Dst)
+	if req.Mode == "scan-single" {
+		args = append(args, req.Src)
+	} else {
+		args = append(args, req.Src, req.Dst)
+	}
 
 	cmd := exec.Command(d.binPath, args...)
 	cmd.Stdout = os.Stdout
@@ -221,6 +234,7 @@ type jobSummary struct {
 	ID             string    `json:"id"`
 	Source         string    `json:"source"`
 	Dest           string    `json:"dest"`
+	Type           string    `json:"type"` // "sync", "scan", "scan-single"
 	Status         string    `json:"status"`
 	StartTime      time.Time `json:"start_time"`
 	EndTime        time.Time `json:"end_time"`
@@ -232,14 +246,13 @@ type jobSummary struct {
 	TotalBytes     int64     `json:"bytes"`
 	BytesFmt       string    `json:"bytes_fmt"`
 	Percent        int       `json:"percent"`
-	DBName         string    `json:"db_name"`
 }
 
 func (d *dbDashboard) queryJobs() ([]jobSummary, error) {
 	var jobs []jobSummary
-	for _, pair := range [][2]string{
-		{"sync_jobs", "juicefs_sync"},
-		{"scan_jobs", "scan_sync"},
+	for _, pair := range [][3]string{
+		{"sync_jobs", "juicefs_sync", "sync"},
+		{"scan_jobs", "scan_sync", "scan"},
 	} {
 		rows, err := d.db.Query(
 			fmt.Sprintf("SELECT id, src_url, dst_url, status, start_time, end_time, total_objects, copied_objects, skipped_objects, failed_objects, deleted_objects, total_bytes FROM `%s`.`sync_jobs` ORDER BY start_time DESC LIMIT 50", pair[0]))
@@ -264,7 +277,7 @@ func (d *dbDashboard) queryJobs() ([]jobSummary, error) {
 					j.Percent = 100
 				}
 			}
-			j.DBName = pair[0]
+			j.Type = pair[2]
 			jobs = append(jobs, j)
 		}
 		rows.Close()
@@ -285,7 +298,7 @@ func (d *dbDashboard) apiJobDetail(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	for _, dbName := range []string{"juicefs_sync", "scan_sync", "single_scan"} {
-		tableName := strings.ReplaceAll(strings.ReplaceAll(jobID, "-", "_"), ".", "_")
+		tableName := "objects_" + strings.ReplaceAll(strings.ReplaceAll(jobID, "-", "_"), ".", "_")
 		var count int
 		d.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", dbName, tableName)).Scan(&count)
 		if count > 0 {
@@ -366,6 +379,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#09090b;color:#e4
 .job-status{padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;text-transform:uppercase}
 .status-completed{background:#052e16;color:#22c55e}.status-running{background:#1e3a5f;color:#3b82f6;animation:pulse 2s infinite}
 .status-failed{background:#450a0a;color:#ef4444}
+.type-badge{padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase;margin-right:8px}.type-sync{background:#1e3a5f;color:#3b82f6}.type-scan{background:#1e2a1e;color:#22c55e}.type-scan-single{background:#2a1e3a;color:#a78bfa}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
 .job-paths{font-size:12px;color:#71717a;margin-bottom:12px;display:flex;gap:12px}
 .job-paths span{color:#a1a1aa}
@@ -379,6 +393,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#09090b;color:#e4
 .form-group label{display:block;font-size:13px;color:#a1a1aa;margin-bottom:6px}
 .form-group input{width:100%;padding:10px 14px;background:#18181b;border:1px solid #27272a;border-radius:8px;color:#e4e4e7;font-size:14px;outline:none;transition:border-color .2s}
 .form-group input:focus{border-color:#6366f1}
+.form-section{margin-bottom:24px}.form-label{font-size:13px;color:#a1a1aa;margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px}
+.mode-selector{display:flex;gap:12px}.mode-option{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;padding:16px 12px;background:#18181b;border:1px solid #27272a;border-radius:10px;cursor:pointer;transition:border-color .2s}.mode-option:hover{border-color:#3f3f46}.mode-option input[type=radio]{display:none}.mode-option:has(input:checked){border-color:#6366f1;background:#1e1b3a}.mode-text{font-size:15px;font-weight:600;color:#e4e4e7}.mode-desc{font-size:11px;color:#71717a}.checkbox-grid{display:flex;gap:20px}.check-label{display:flex;align-items:center;gap:6px;font-size:14px;color:#a1a1aa;cursor:pointer}.check-label input[type=checkbox]{accent-color:#6366f1;width:16px;height:16px}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .btn{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;background:linear-gradient(135deg,#6366f1,#8b5cf6);border:none;border-radius:8px;color:#fff;font-size:15px;font-weight:600;cursor:pointer;transition:opacity .2s}
 .btn:hover{opacity:.9}
@@ -418,15 +434,12 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#09090b;color:#e4
 
 <div class="panel" id="panel-new-task">
 <form id="task-form" onsubmit="startSync(event)" style="max-width:600px;margin:0 auto">
+<div class="form-section"><div class="form-label">Mode</div><div class="mode-selector"><label class="mode-option"><input type="radio" name="mode" value="sync" checked onchange="toggleDst()"><span class="mode-text">Sync</span><span class="mode-desc">Copy data</span></label><label class="mode-option"><input type="radio" name="mode" value="scan" onchange="toggleDst()"><span class="mode-text">Scan</span><span class="mode-desc">Compare only</span></label><label class="mode-option"><input type="radio" name="mode" value="scan-single" onchange="toggleDst()"><span class="mode-text">Scan Single</span><span class="mode-desc">List one bucket</span></label></div></div>
 <div class="row"><div class="form-group"><label>Source (SRC)</label><input id="src" placeholder="s3://ak:sk@bucket.endpoint/"></div>
-<div class="form-group"><label>Destination (DST)</label><input id="dst" placeholder="s3://ak:sk@bucket.endpoint/"></div></div>
+<div class="form-group" id="dst-group"><label>Destination (DST)</label><input id="dst" placeholder="s3://ak:sk@bucket.endpoint/"></div></div>
 <div class="row">
 <div class="form-group"><label>Threads</label><input id="threads" type="number" value="10"></div>
-<div class="form-group" style="display:flex;align-items:flex-end;gap:16px;padding-bottom:10px">
-<label style="display:flex;align-items:center;gap:6px;font-size:14px;color:#a1a1aa;cursor:pointer"><input type="checkbox" id="no-https" checked>No HTTPS</label>
-<label style="display:flex;align-items:center;gap:6px;font-size:14px;color:#a1a1aa;cursor:pointer"><input type="checkbox" id="preserve-meta">Preserve Meta</label>
-<label style="display:flex;align-items:center;gap:6px;font-size:14px;color:#a1a1aa;cursor:pointer"><input type="checkbox" id="force-update">Force Update</label>
-</div></div>
+<div class="form-section"><div class="form-label">Options</div><div class="checkbox-grid"><label class="check-label"><input type="checkbox" id="no-https" checked> No HTTPS</label><label class="check-label"><input type="checkbox" id="preserve-meta"> Preserve Meta</label><label class="check-label"><input type="checkbox" id="force-update"> Force Update</label></div></div></div>
 <button type="submit" class="btn" id="sync-btn">&#9654; Start Sync</button>
 </form>
 <div id="toast"></div>
@@ -453,7 +466,7 @@ function toast(msg,ok){var d=document.createElement('div');d.className='toast to
 function startSync(e){e.preventDefault();
 var btn=document.getElementById('sync-btn');btn.disabled=true;btn.textContent='Starting...';
 fetch('/api/sync',{method:'POST',body:JSON.stringify({
-src:document.getElementById('src').value,dst:document.getElementById('dst').value,
+src:document.getElementById('src').value,dst:document.getElementById('dst').value,mode:document.querySelector('input[name="mode"]:checked').value,
 threads:parseInt(document.getElementById('threads').value)||10,
 no_https:document.getElementById('no-https').checked,
 preserve_meta:document.getElementById('preserve-meta').checked,
@@ -489,6 +502,7 @@ document.getElementById('stat-copied').textContent=copied;
 document.getElementById('stat-skipped').textContent=skipped;
 document.getElementById('stat-failed').textContent=failed;
 document.getElementById('footer').textContent='Updated: '+new Date().toLocaleTimeString()})}
+function toggleDst(){var m=document.querySelector('input[name="mode"]:checked').value;document.getElementById('dst-group').style.display=m=='scan-single'?'none':'block'}
 function short(s){if(!s)return'';var i=s.indexOf('://');var t=i>0?s.substring(i+3):s;return t.length>40?t.substring(0,40)+'...':t}
 function timeFmt(t){if(!t)return'';return new Date(t).toLocaleString()}
 loadJobs();setInterval(loadJobs,10000);setInterval(loadRunning,5000);
