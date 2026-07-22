@@ -163,11 +163,11 @@ func (p *withPrefix) PutWithMeta(ctx context.Context, key string, in io.Reader, 
 	if mp, ok := p.os.(MetadataPutter); ok {
 		return mp.PutWithMeta(ctx, p.prefix+key, in, meta, getters...)
 	}
-	return p.Put(ctx, p.prefix+key, in, getters...)
+	return p.os.Put(ctx, p.prefix+key, in, getters...)
 }
 
 func (p *withPrefix) Copy(ctx context.Context, dst, src string) error {
-	return p.os.Copy(ctx, dst, src)
+	return p.os.Copy(ctx, p.prefix+dst, p.prefix+src)
 }
 
 func (p *withPrefix) Delete(ctx context.Context, key string, getters ...AttrGetter) error {
@@ -235,7 +235,7 @@ func (p *withPrefix) CreateMultipartUploadWithMeta(ctx context.Context, key stri
 	if mc, ok := p.os.(MetadataMultipartCreator); ok {
 		return mc.CreateMultipartUploadWithMeta(ctx, p.prefix+key, meta)
 	}
-	return p.CreateMultipartUpload(ctx, p.prefix+key)
+	return p.CreateMultipartUpload(ctx, key)
 }
 
 func (p *withPrefix) UploadPart(ctx context.Context, key string, uploadID string, num int, body []byte) (*Part, error) {

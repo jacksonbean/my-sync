@@ -278,31 +278,63 @@ func (m *CheckpointManager) Save(ckpt *Checkpoint) error {
 
 	ckpt.UpdatedAt = time.Now()
 
+	// Build a consistent, deep snapshot of the checkpoint under the relevant
+	// read locks, then marshal the snapshot. This avoids racing with producer
+	// goroutines that mutate PrefixState / MultipartUploads / delay-del lists
+	// concurrently with json.Marshal (and previously mutated ckpt fields after
+	// releasing the lock, then raced with the marshal read).
+	snap := &Checkpoint{
+		Config:    ckpt.Config,
+		Stats:     ckpt.Stats,
+		UpdatedAt: ckpt.UpdatedAt,
+	}
+
 	ckpt.RLock()
-	prefixCount := len(ckpt.PrefixState)
-	for _, state := range ckpt.PrefixState {
-		state.RLock()
+	snap.PrefixState = make(map[string]*PrefixState, len(ckpt.PrefixState))
+	for name, st := range ckpt.PrefixState {
+		st.RLock()
+		snap.PrefixState[name] = &PrefixState{
+			ListDone:      st.ListDone,
+			LastListedKey: st.LastListedKey,
+			ListDepth:     st.ListDepth,
+			PendingKeys:   maps.Clone(st.PendingKeys),
+			FailedKeys:    maps.Clone(st.FailedKeys),
+			isNew:         st.isNew,
+		}
+		st.RUnlock()
 	}
+
 	m.multipartUploadStore.RLock()
-	data, err := json.Marshal(ckpt)
-	m.multipartUploadStore.RUnlock()
-	for _, state := range ckpt.PrefixState {
-		state.RUnlock()
+	snap.MultipartUploads = make(map[string]*multipartUploadState, len(m.multipartUploadStore.uploads))
+	for k, up := range m.multipartUploadStore.uploads {
+		snap.MultipartUploads[k] = &multipartUploadState{
+			Upload:    up.Upload,
+			Size:      up.Size,
+			Mtime:     up.Mtime,
+			Parts:     maps.Clone(up.Parts),
+			Checksums: maps.Clone(up.Checksums),
+		}
 	}
+	m.multipartUploadStore.RUnlock()
+
+	// Snapshot the global delay-delete lists under their mutexes.
 	srcDelayDelMu.Lock()
-	ckpt.SrcDelayDel = append([]string(nil), srcDelayDel...)
+	snap.SrcDelayDel = append([]string(nil), srcDelayDel...)
 	srcDelayDelMu.Unlock()
 	dstDelayDelMu.Lock()
-	ckpt.DstDelayDel = append([]string(nil), dstDelayDel...)
+	snap.DstDelayDel = append([]string(nil), dstDelayDel...)
 	dstDelayDelMu.Unlock()
+
 	ckpt.RUnlock()
+
+	data, err := json.Marshal(snap)
 
 	if err != nil {
 		return fmt.Errorf("failed to marshal checkpoint: %w", err)
 	}
 
 	logger.Debugf("Saving checkpoint with %d prefixes, copied: %d, failed: %d",
-		prefixCount, ckpt.Stats.Copied, ckpt.Stats.Failed)
+		len(snap.PrefixState), snap.Stats.Copied, snap.Stats.Failed)
 	reader := bytes.NewReader(data)
 	if err := m.dst.Put(ctx, m.checkpointKey, reader); err != nil {
 		return fmt.Errorf("failed to put checkpoint: %w", err)
@@ -805,7 +837,20 @@ func (m *CheckpointManager) SaveOnSignal() {
 			logger.Infof("Checkpoint saved successfully")
 		}
 
-		// TODO: use context cancel.
+		// Flush any pending async DB writes before exiting
+		if syncDbService != nil {
+			_ = syncDbService.Close()
+		}
+		if gateBuf != nil {
+			_ = gateBuf.Close()
+		}
+		if outputCSV != nil {
+			outputCSV.Flush()
+		}
+		if outputCSVFile != nil {
+			_ = outputCSVFile.Close()
+		}
+
 		os.Exit(0)
 	}()
 }

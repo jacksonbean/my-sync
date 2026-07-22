@@ -121,9 +121,10 @@ func (r *parallelDownloader) Read(b []byte) (int, error) {
 		r.notify.Wait()
 	}
 	p := r.buffers[off]
+	err := r.err
 	r.Unlock()
 	if p == nil {
-		return 0, r.err
+		return 0, err
 	}
 	n := copy(b, (*p)[r.off-off:])
 	r.off += int64(n)

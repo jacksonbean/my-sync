@@ -73,6 +73,10 @@ var (
 	concurrent              chan int
 	limiter                 *mixedLimiter
 	totalHandled            atomic.Int64
+
+	// 双层门卫全局变量（由 Sync() 初始化，produce/worker 使用）
+	gateSvc sync_db.DbGateService
+	gateBuf *GateRecordBuffer
 )
 
 type mixedLimiter struct {
@@ -197,11 +201,24 @@ var ctx = context.Background()
 var preserveMeta bool
 var syncDbService *sync_db.AsyncDbService
 var syncDbJobID string
-var syncSrc object.ObjectStorage    // source storage for Head in recordSyncObject
-var srcMetaCache sync.Map          // key → object.ObjectMeta, cache from copy paths
+
+// maskStorageURL replaces credentials in a storage URL with *** for safe logging.
+func maskStorageURL(s fmt.Stringer) string {
+	u := s.String()
+	if idx := strings.Index(u, "://"); idx > 0 {
+		// Between :// and the next @ is the credentials part
+		if atIdx := strings.Index(u[idx+3:], "@"); atIdx >= 0 {
+			return u[:idx+3] + "***:***@" + u[idx+3+atIdx+1:]
+		}
+	}
+	return u
+}
+
+var syncSrc object.ObjectStorage // source storage for Head in recordSyncObject; each worker process has its own copy
+var srcMetaCache sync.Map        // key → object.ObjectMeta, cache from copy paths
 var outputCSV *csv.Writer
 var outputCSVFile *os.File
-var doubleCheckPass int            // 0 = first pass, 1 = second pass
+var doubleCheckPass int // 0 = first pass, 1 = second pass
 
 func incrTotal(n int64) {
 	totalHandled.Add(n)
@@ -251,7 +268,10 @@ func listAll(store object.ObjectStorage, prefix, start, end string, followLink, 
 	startTime := time.Now()
 	logger.Debugf("Iterating objects from %s with prefix %s start %q", store, prefix, start)
 
-	out := make(chan object.Object, maxResults*10)
+	// Buffer 3 pages to smooth List-to-List latency jitter without wasting memory.
+	// For billion-scale syncs the real bottleneck is the produce side (destination
+	// Head calls), which the two-layer gate system addresses.
+	out := make(chan object.Object, maxResults*3)
 
 	// As the result of object storage's List method doesn't include the marker key,
 	// we try List the marker key separately.
@@ -264,13 +284,17 @@ func listAll(store object.ObjectStorage, prefix, start, end string, followLink, 
 
 	if ch, err := store.ListAll(ctx, prefix, start, followLink); err == nil {
 		go func() {
+			defer close(out)
 			for obj := range ch {
 				if obj != nil && end != "" && obj.Key() > end {
 					break
 				}
-				out <- obj
+				select {
+				case out <- obj:
+				case <-ctx.Done():
+					return
+				}
 			}
-			close(out)
 		}()
 		return out, nil
 	} else if !errors.Is(err, utils.ErrNotSUP) {
@@ -290,6 +314,7 @@ func listAll(store object.ObjectStorage, prefix, start, end string, followLink, 
 	}
 	logger.Debugf("Found %d object from %s in %s", len(objs), store, time.Since(startTime))
 	go func() {
+		defer close(out)
 		lastkey := ""
 		first := true
 	END:
@@ -298,15 +323,22 @@ func listAll(store object.ObjectStorage, prefix, start, end string, followLink, 
 				key := obj.Key()
 				if !first && key <= lastkey {
 					logger.Errorf("The keys are out of order: marker %q, last %q current %q", marker, lastkey, key)
-					out <- nil
+					select {
+					case out <- nil:
+					case <-ctx.Done():
+						return
+					}
 					break END
 				}
 				if end != "" && key > end {
 					break END
 				}
 				lastkey = key
-				// logger.Debugf("key: %s", key)
-				out <- obj
+				select {
+				case out <- obj:
+				case <-ctx.Done():
+					return
+				}
 				first = false
 			}
 			if !hasMore {
@@ -330,7 +362,11 @@ func listAll(store object.ObjectStorage, prefix, start, end string, followLink, 
 			logger.Debugf("Found %d object from %s in %s", len(objs), store, time.Since(startTime))
 			if err != nil {
 				// Telling that the listing has failed
-				out <- nil
+				select {
+				case out <- nil:
+				case <-ctx.Done():
+					return
+				}
 				logger.Errorf("Fail to list after %s: %s", marker, err.Error())
 				break
 			}
@@ -340,7 +376,6 @@ func listAll(store object.ObjectStorage, prefix, start, end string, followLink, 
 				objs = objs[1:]
 			}
 		}
-		close(out)
 	}()
 	return out, nil
 }
@@ -665,20 +700,26 @@ func doCopySingle(src, dst object.ObjectStorage, key string, size int64, calChks
 		}
 		r := &chksumReader{in, 0, calChksum}
 		if err == nil {
-			if srcMeta, ok := getSrcMeta(src, key); ok {
-				if !preserveMeta {
-					srcMeta.Metadata = nil
-				}
-							if mp, ok2 := dst.(object.MetadataPutter); ok2 {
-					err = mp.PutWithMeta(ctx, key, &withProgress{r}, srcMeta)
-					return r.chksum, err
-				}
+			srcMeta := getAndCacheSrcMeta(src, key)
+			if mp, ok2 := dst.(object.MetadataPutter); ok2 {
+				err = mp.PutWithMeta(ctx, key, &withProgress{r}, srcMeta)
+				return r.chksum, err
 			}
 			err = dst.Put(ctx, key, &withProgress{r})
 		}
 		return r.chksum, err
 	}
 	return doCopySingle0(src, dst, key, size, calChksum)
+}
+
+// getAndCacheSrcMeta retrieves metadata from source, caches it, and applies preserveMeta settings.
+func getAndCacheSrcMeta(src object.ObjectStorage, key string) object.ObjectMeta {
+	srcMeta, _ := getSrcMeta(src, key)
+	if !preserveMeta {
+		srcMeta.Metadata = nil
+	}
+	srcMetaCache.Store(key, srcMeta)
+	return srcMeta
 }
 
 func doCopySingle0(src, dst object.ObjectStorage, key string, size int64, calChksum bool) (uint32, error) {
@@ -688,11 +729,7 @@ func doCopySingle0(src, dst object.ObjectStorage, key string, size int64, calChk
 	}()
 	var in io.ReadCloser
 	var err error
-	srcMeta, _ := getSrcMeta(src, key)
-	if !preserveMeta {
-		srcMeta.Metadata = nil
-	}
-	srcMetaCache.Store(key, srcMeta)
+	srcMeta := getAndCacheSrcMeta(src, key)
 	if size == 0 {
 		if key == "" && !object.IsFileSystem(dst) {
 			ps := strings.SplitN(dst.String(), "/", 4)
@@ -897,30 +934,71 @@ func doCopyRange(src, dst object.ObjectStorage, key string, off, size int64, upl
 	n := int((size-1)/partSize) + 1
 	logger.Debugf("Copying data of %s (range: %d,%d) as %d parts (size: %d): %s", key, off, size, n, partSize, up.UploadID)
 	parts := make([]*object.Part, n)
+	chksums := make([]uint32, n)
 	var tmpChksum uint32
-	first := true
 
+	errs := make(chan error, n)
 	for i := 0; i < n; i++ {
 		sz := partSize
 		if i == n-1 {
 			sz = size - int64(i)*partSize
 		}
-		select {
-		case <-abort:
+		go func(num int, sz int64) {
+			select {
+			case <-abort:
+				errs <- fmt.Errorf("aborted")
+				return
+			default:
+			}
+			var chksum uint32
+			var perr error
+			parts[num], chksum, perr = doUploadPart(src, dst, key, off+int64(num)*partSize, sz, tmpkey, up.UploadID, num, calChksum)
+			if perr != nil {
+				errs <- fmt.Errorf("range(%d,%d): %s", off, size, perr)
+				return
+			}
+			if calChksum {
+				// doUploadPart already computed the part checksum when the data
+				// was streamed locally (non-copy path). For server-side copy it
+				// returns 0, in which case we re-read the uploaded part below.
+				chksums[num] = chksum
+				errs <- nil
+				return
+			}
+			errs <- nil
+		}(i, sz)
+	}
+
+	for i := 0; i < n; i++ {
+		if err = <-errs; err != nil {
 			dst.AbortUpload(ctx, tmpkey, up.UploadID)
-			return nil, 0, fmt.Errorf("aborted")
-		default:
+			return nil, 0, err
 		}
-		var chksum uint32
-		parts[i], chksum, err = doUploadPart(src, dst, key, off+int64(i)*partSize, sz, tmpkey, up.UploadID, i, calChksum)
-		if err != nil {
-			dst.AbortUpload(ctx, tmpkey, up.UploadID)
-			return nil, 0, fmt.Errorf("range(%d,%d): %s", off, size, err)
-		}
-		if calChksum {
-			if first {
+	}
+
+	if calChksum {
+		// Combine per-part checksums. Reuse the checksum computed during the
+		// upload when available; only re-read the uploaded part from the target
+		// when it wasn't computed (server-side copy path), avoiding a full
+		// second read of parts whose checksum we already have.
+		for i := 0; i < n; i++ {
+			sz := partSize
+			if i == n-1 {
+				sz = size - int64(i)*partSize
+			}
+			var chksum uint32
+			if chksums[i] != 0 {
+				chksum = chksums[i]
+			} else {
+				var cerr error
+				chksum, cerr = calPartChksum(dst, tmpkey, abort, int64(i)*partSize, sz)
+				if cerr != nil {
+					dst.AbortUpload(ctx, tmpkey, up.UploadID)
+					return nil, 0, fmt.Errorf("range(%d,%d) checksum: %s", off, size, cerr)
+				}
+			}
+			if i == 0 {
 				tmpChksum = chksum
-				first = false
 			} else {
 				tmpChksum = crc32combine.CRC32Combine(crc32.Castagnoli, tmpChksum, chksum, sz)
 			}
@@ -1064,7 +1142,7 @@ func copyData(src, dst object.ObjectStorage, key string, size int64, mtime time.
 				if !preserveMeta {
 					srcMeta.Metadata = nil
 				}
-							if srcMeta.ContentType != "" || len(srcMeta.Metadata) > 0 {
+				if srcMeta.ContentType != "" || len(srcMeta.Metadata) > 0 {
 					if mc, ok2 := dst.(object.MetadataMultipartCreator); ok2 {
 						upload, err = mc.CreateMultipartUploadWithMeta(ctx, key, srcMeta)
 					}
@@ -1113,7 +1191,6 @@ var holders []*holder
 
 func fetchTask(tasks chan object.Object) (t object.Object, done func()) {
 	muHolder.Lock()
-	defer muHolder.Unlock()
 	if len(holders) > 0 {
 		h := holders[len(holders)-1]
 		holders = holders[:len(holders)-1]
@@ -1121,6 +1198,8 @@ func fetchTask(tasks chan object.Object) (t object.Object, done func()) {
 		<-h.done
 		muHolder.Lock()
 	}
+	// Release lock before blocking channel read
+	muHolder.Unlock()
 	if t = <-tasks; t == nil {
 		return nil, func() {}
 	}
@@ -1132,9 +1211,11 @@ func fetchTask(tasks chan object.Object) (t object.Object, done func()) {
 		done := make(chan struct{})
 		h := &holder{done: done}
 		n := min(int(size)/maxBlock, 20)
+		muHolder.Lock()
 		for i := 1; i < n; i++ {
 			holders = append(holders, h)
 		}
+		muHolder.Unlock()
 		return t, func() { close(done) }
 	} else {
 		return t, func() {}
@@ -1181,52 +1262,58 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 				break
 			}
 			obj = withoutSize(obj)
-			if equal, err := checkSum(src, dst, key, nil, obj, config); err != nil {
-				failed.Increment()
-				taskErr = err
-				break
+			// markChecksum is a verify-then-copy optimization that only makes
+			// sense when a checksum mode is requested. The checked/checkedBytes
+			// counters are initialized only for CheckAll/CheckNew/CheckChange,
+			// so calling checkSum without one of those would nil-deref.
+			if config.CheckAll || config.CheckNew || config.CheckChange {
+				if equal, err := checkSum(src, dst, key, nil, obj, config); err != nil {
+					failed.Increment()
+					taskErr = err
 					if syncDbService != nil {
 						recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusFailed, err.Error())
 					}
-			} else if equal {
-				if config.DeleteSrc {
-					if obj.IsDir() {
-						srcDelayDelMu.Lock()
-						srcDelayDel = append(srcDelayDel, key)
-						srcDelayDelMu.Unlock()
-					} else {
-						taskErr = deleteObj(src, key, false)
-					}
-				} else if config.Perms && (!obj.IsSymlink() || !config.Links) {
-					if o, e := dst.Head(ctx, key); e == nil {
-						if needCopyPerms(obj, o) {
-							copyPerms(dst, obj, config)
-							copied.Increment()
+					break
+				} else if equal {
+					if config.DeleteSrc {
+						if obj.IsDir() {
+							srcDelayDelMu.Lock()
+							srcDelayDel = append(srcDelayDel, key)
+							srcDelayDelMu.Unlock()
 						} else {
-							skipped.Increment()
-							skippedBytes.IncrInt64(obj.Size())
+							taskErr = deleteObj(src, key, false)
 						}
-						if syncDbService != nil {
-							recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusSkipped, "")
+					} else if config.Perms && (!obj.IsSymlink() || !config.Links) {
+						if o, e := dst.Head(ctx, key); e == nil {
+							if needCopyPerms(obj, o) {
+								copyPerms(dst, obj, config)
+								copied.Increment()
+							} else {
+								skipped.Increment()
+								skippedBytes.IncrInt64(obj.Size())
+							}
+							if syncDbService != nil {
+								recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusSkipped, "")
+							}
+						} else {
+							logger.Warnf("Failed to head object %s: %s", key, e)
+							failed.Increment()
+							taskErr = e
+							if syncDbService != nil {
+								recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusFailed, e.Error())
+							}
 						}
 					} else {
-						logger.Warnf("Failed to head object %s: %s", key, e)
-						failed.Increment()
-						taskErr = e
-						if syncDbService != nil {
-							recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusFailed, e.Error())
-						}
+						skipped.Increment()
+						skippedBytes.IncrInt64(obj.Size())
 					}
-				} else {
-					skipped.Increment()
-					skippedBytes.IncrInt64(obj.Size())
+					if syncDbService != nil {
+						recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusSkipped, "")
+					}
+					break
 				}
-				if syncDbService != nil {
-					recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusSkipped, "")
-				}
-				break
 			}
-			// checkSum not equal, copy the object
+			// checkSum not equal (or verification disabled), copy the object
 			fallthrough
 		default:
 			if config.Dry {
@@ -1260,7 +1347,7 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 					err = fmt.Errorf("checksums of copied object %s don't match", key)
 				}
 			}
-		if err == nil {
+			if err == nil {
 				if mc, ok := dst.(object.MtimeChanger); ok {
 					if err = mc.Chtimes(obj.Key(), obj.Mtime()); err != nil && !errors.Is(err, utils.ErrNotSUP) {
 						logger.Warnf("Update mtime of %s: %s", key, err)
@@ -1273,6 +1360,9 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 				if syncDbService != nil {
 					recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusCopied, "")
 				}
+				if gateBuf != nil {
+					RecordSuccess(gateBuf, obj, 0)
+				}
 			} else if errors.Is(err, utils.ErrSkipped) {
 				skipped.Increment()
 				if syncDbService != nil {
@@ -1284,6 +1374,9 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 				taskErr = err
 				if syncDbService != nil {
 					recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusFailed, err.Error())
+				}
+				if gateBuf != nil {
+					RecordFailure(gateBuf, obj, err, 0)
 				}
 			}
 			if taskErr == nil && config.DeleteSrcAfter {
@@ -1431,13 +1524,13 @@ func handleExtraObject(tasks chan<- object.Object, dstobj object.Object, config 
 		return false
 	}
 	incrTotal(1)
-	if !config.DeleteDst || !config.Dirs && dstobj.IsDir() || config.Limit == 0 {
+	if !config.DeleteDst || !config.Dirs && dstobj.IsDir() || atomic.LoadInt64(&config.Limit) == 0 {
 		logger.Debug("Ignore extra object", dstobj.Key())
 		extra.Increment()
 		extraBytes.IncrInt64(dstobj.Size())
 		return false
 	}
-	config.Limit--
+	config.LimitDecr()
 	if dstobj.IsDir() {
 		dstDelayDelMu.Lock()
 		dstDelayDel = append(dstDelayDel, dstobj.Key())
@@ -1449,7 +1542,7 @@ func handleExtraObject(tasks chan<- object.Object, dstobj object.Object, config 
 		}
 		tasks <- obj
 	}
-	return config.Limit == 0
+	return atomic.LoadInt64(&config.Limit) == 0
 }
 
 func startSingleProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, prefix string, config *Config, checkpointMgr *CheckpointManager) error {
@@ -1510,9 +1603,9 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 		}
 		skip++
 		skipBytes += obj.Size()
-			if syncDbService != nil {
-				recordSyncObject(syncDbJobID, obj.Key(), obj.Size(), time.Now(), sync_db.StatusSkipped, "")
-			}
+		if syncDbService != nil {
+			recordSyncObject(syncDbJobID, obj.Key(), obj.Size(), time.Now(), sync_db.StatusSkipped, "")
+		}
 		if skip > 100 || time.Since(lastUpdate) > time.Millisecond*100 {
 			lastUpdate = time.Now()
 			flushProgress()
@@ -1538,11 +1631,21 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 			logger.Debug("Ignore directory ", obj.Key())
 			continue
 		}
-		if config.Limit >= 0 {
-			if config.Limit == 0 {
+		if atomic.LoadInt64(&config.Limit) >= 0 {
+			claimed := false
+			for {
+				cur := atomic.LoadInt64(&config.Limit)
+				if cur <= 0 {
+					return nil
+				}
+				if atomic.CompareAndSwapInt64(&config.Limit, cur, cur-1) {
+					claimed = true
+					break
+				}
+			}
+			if !claimed {
 				return nil
 			}
-			config.Limit--
 		}
 		incrTotal(1)
 
@@ -1567,6 +1670,27 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 			}
 		}
 
+		// ========== 【第一层：DB 快速门卫】==========
+		// 必须先完成 src/dst key 对齐和 extra 处理，再做 GateSkip；否则
+		// --delete-dst 会把“源被 gate 跳过、但目标实际存在”的对象误删。
+		if gateSvc != nil && !config.ForceUpdate {
+			record, err := gateSvc.GetRecord(obj.Key())
+			if err != nil {
+				logger.Warnf("firstGate: failed to query db for %s: %s", obj.Key(), err)
+			} else {
+				result := firstGate(obj, record, config.ForceUpdate)
+				if result == sync_db.GateSkip {
+					if dstobj != nil && obj.Key() == dstobj.Key() {
+						dstobj = nil
+					}
+					skipIt(obj)
+					continue
+				}
+				// GateMissing / GateNeedSecondGate → 继续走第二层
+			}
+		}
+		// ============================================
+
 		// FIXME: there is a race when source is modified during coping
 		if dstobj == nil || obj.Key() < dstobj.Key() {
 			if config.Existing {
@@ -1580,29 +1704,72 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 				dstobj = nil
 				continue
 			}
-			if config.ForceUpdate ||
-				(config.Update && obj.Mtime().Unix() > dstobj.Mtime().Unix()) ||
-				(!config.Update && obj.Size() != dstobj.Size()) {
-				sendTask(obj)
-			} else if config.Update && obj.Mtime().Unix() < dstobj.Mtime().Unix() {
-				skipIt(obj)
-			} else if config.CheckAll { // two objects are likely the same
-				sendTask(withSize(obj, markChecksum))
-			} else if config.DeleteSrc {
-				if obj.IsDir() {
-					if checkpointMgr != nil {
-						checkpointMgr.UpdateLastListedKey(prefix, obj)
+			// 记录目标端大小（用于诊断）
+			targetSize := dstobj.Size()
+
+			// sendWithMarks applies the exact task marker (checksum / delete-src /
+			// copy-perms) for an object that must be sent, mirroring the original
+			// stock behavior.
+			sendWithMarks := func(o, d object.Object) {
+				if config.CheckAll { // two objects are likely the same
+					sendTask(withSize(o, markChecksum))
+				} else if config.DeleteSrc {
+					if o.IsDir() {
+						if checkpointMgr != nil {
+							checkpointMgr.UpdateLastListedKey(prefix, o)
+						}
+						srcDelayDelMu.Lock()
+						srcDelayDel = append(srcDelayDel, o.Key())
+						srcDelayDelMu.Unlock()
+					} else {
+						sendTask(withSize(o, markDeleteSrc))
 					}
-					srcDelayDelMu.Lock()
-					srcDelayDel = append(srcDelayDel, obj.Key())
-					srcDelayDelMu.Unlock()
+				} else if config.Perms && needCopyPerms(o, d) {
+					sendTask(withSize(o, markCopyPerms))
 				} else {
-					sendTask(withSize(obj, markDeleteSrc))
+					sendTask(o)
 				}
-			} else if config.Perms && needCopyPerms(obj, dstobj) {
-				sendTask(withSize(obj, markCopyPerms))
+			}
+
+			if gateSvc != nil {
+				// 启用双层门卫：第二层实时门卫裁决（保护目标端被外部修改的新数据）
+				action := secondGate(obj, dstobj, config.ForceUpdate)
+				if action == ActionSend {
+					sendWithMarks(obj, dstobj)
+				} else {
+					// 被第二层门卫跳过（目标 mtime 更新，保护目标端）
+					if gateBuf != nil && targetSize != 0 {
+						RecordSkip(gateBuf, obj, targetSize)
+					}
+					skipIt(obj)
+				}
 			} else {
-				skipIt(obj)
+				// 未启用门卫：使用 fork 原有的大小/Update 比较逻辑，
+				// 保证默认同步语义不被门卫的保护策略改变。
+				if config.ForceUpdate ||
+					(config.Update && obj.Mtime().Unix() > dstobj.Mtime().Unix()) ||
+					(!config.Update && obj.Size() != dstobj.Size()) {
+					sendTask(obj)
+				} else if config.Update && obj.Mtime().Unix() < dstobj.Mtime().Unix() {
+					skipIt(obj)
+				} else if config.CheckAll { // two objects are likely the same
+					sendTask(withSize(obj, markChecksum))
+				} else if config.DeleteSrc {
+					if obj.IsDir() {
+						if checkpointMgr != nil {
+							checkpointMgr.UpdateLastListedKey(prefix, obj)
+						}
+						srcDelayDelMu.Lock()
+						srcDelayDel = append(srcDelayDel, obj.Key())
+						srcDelayDelMu.Unlock()
+					} else {
+						sendTask(withSize(obj, markDeleteSrc))
+					}
+				} else if config.Perms && needCopyPerms(obj, dstobj) {
+					sendTask(withSize(obj, markCopyPerms))
+				} else {
+					skipIt(obj)
+				}
 			}
 			dstobj = nil
 		}
@@ -1849,7 +2016,7 @@ func matchLeveledPath(rules []rule, key string) bool {
 }
 
 func listCommonPrefix(store object.ObjectStorage, prefix string, cp chan object.Object, followLink bool, startAfter string, onChildPrefix func(string)) (chan object.Object, error) {
-	var total []object.Object
+	srckeys := make(chan object.Object, 1000)
 	var objs []object.Object
 	var err error
 	var nextToken string
@@ -1861,32 +2028,32 @@ func listCommonPrefix(store object.ObjectStorage, prefix string, cp chan object.
 		strings.HasPrefix(store.String(), "hdfs://") || strings.HasPrefix(store.String(), "webdav://") {
 		thisListMaxResults = math.MaxInt64
 	}
-	for {
-		objs, hasMore, nextToken, err = store.List(ctx, prefix, marker, nextToken, "/", thisListMaxResults, followLink)
-		if err != nil {
-			return nil, err
-		}
-		if len(objs) > 0 {
-			total = append(total, objs...)
-			marker = objs[len(objs)-1].Key()
-		}
-		if !hasMore {
-			break
-		}
-	}
-	srckeys := make(chan object.Object, 1000)
+
 	go func() {
 		defer close(srckeys)
-		for _, o := range total {
-			if o.IsDir() && o.Key() > prefix {
-				if cp != nil {
-					if onChildPrefix != nil {
-						onChildPrefix(o.Key())
+		for {
+			objs, hasMore, nextToken, err = store.List(ctx, prefix, marker, nextToken, "/", thisListMaxResults, followLink)
+			if err != nil {
+				logger.Errorf("list common prefixes %s: %s", prefix, err)
+				return
+			}
+			if len(objs) > 0 {
+				marker = objs[len(objs)-1].Key()
+				for _, o := range objs {
+					if o.IsDir() && o.Key() > prefix {
+						if cp != nil {
+							if onChildPrefix != nil {
+								onChildPrefix(o.Key())
+							}
+							cp <- o
+						}
+					} else {
+						srckeys <- o
 					}
-					cp <- o
 				}
-			} else {
-				srckeys <- o
+			}
+			if !hasMore {
+				break
 			}
 		}
 	}()
@@ -2039,7 +2206,7 @@ func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, pr
 	defer func() {
 		<-config.concurrentList
 	}()
-	if config.Limit == 1 && len(config.rules) == 0 {
+	if atomic.LoadInt64(&config.Limit) == 1 && len(config.rules) == 0 {
 		if produceSingleObject(tasks, src, dst, prefix, config, checkpointMgr) == nil {
 			return nil
 		}
@@ -2182,14 +2349,14 @@ func scanSingle(src object.ObjectStorage) error {
 		}
 	}
 
-	logger.Infof("Single scan complete: %d objects in %s", total, time.Since(startTime))
+	logger.Infof("Single scan complete: %d objects in %s (%.0f objects/s)", total, time.Since(startTime), float64(total)/time.Since(startTime).Seconds())
 
-	_ = syncDbService.Close()
 	if syncDbService != nil {
+		_ = syncDbService.Close()
 		_ = syncDbService.EndJob(syncDbJobID, sync_db.JobInfo{
-			ID:          syncDbJobID,
-			Status:      sync_db.JobCompleted,
-			EndTime:     time.Now(),
+			ID:           syncDbJobID,
+			Status:       sync_db.JobCompleted,
+			EndTime:      time.Now(),
 			TotalObjects: total,
 		})
 	}
@@ -2236,7 +2403,6 @@ func scanOnly(src, dst object.ObjectStorage) error {
 
 	var total, matches, differs, missing, errors, extras int64
 	startTime := time.Now()
-	srcKeys := make(map[string]bool)
 
 	if outputCSV != nil {
 		outputCSV.Write([]string{"source_key", "size", "content_type", "status"})
@@ -2248,7 +2414,6 @@ func scanOnly(src, dst object.ObjectStorage) error {
 		}
 		total++
 		key := obj.Key()
-		srcKeys[key] = true
 
 		// Head destination
 		dstObj, dstErr := dst.Head(ctx, key)
@@ -2269,12 +2434,25 @@ func scanOnly(src, dst object.ObjectStorage) error {
 			errors++
 		}
 
-		// Record to db
-		srcMeta, _ := getSrcMeta(src, key)
-		var metaJSON string
-		if srcMeta.Metadata != nil {
-			if b, e := json.Marshal(srcMeta.Metadata); e == nil {
+		// Record to db — prefer list result; fall back to Head only when the
+		// listing did not carry Content-Type/metadata.
+		contentType := obj.ContentType()
+		metaJSON := ""
+		if md := obj.Metadata(); len(md) > 0 {
+			if b, e := json.Marshal(md); e == nil {
 				metaJSON = string(b)
+			}
+		}
+		if contentType == "" || metaJSON == "" {
+			if srcMeta, ok := getSrcMeta(src, key); ok {
+				if contentType == "" {
+					contentType = srcMeta.ContentType
+				}
+				if metaJSON == "" && len(srcMeta.Metadata) > 0 {
+					if b, e := json.Marshal(srcMeta.Metadata); e == nil {
+						metaJSON = string(b)
+					}
+				}
 			}
 		}
 		_ = syncDbService.RecordObject(sync_db.ObjectRecord{
@@ -2282,7 +2460,7 @@ func scanOnly(src, dst object.ObjectStorage) error {
 			SourceKey:   key,
 			TargetKey:   key,
 			Size:        obj.Size(),
-			ContentType: srcMeta.ContentType,
+			ContentType: contentType,
 			Metadata:    metaJSON,
 			Status:      status,
 			StartTime:   startTime,
@@ -2294,7 +2472,7 @@ func scanOnly(src, dst object.ObjectStorage) error {
 				total, matches, differs, missing, errors)
 		}
 		if outputCSV != nil {
-			outputCSV.Write([]string{key, fmt.Sprintf("%d", obj.Size()), srcMeta.ContentType, string(status)})
+			outputCSV.Write([]string{key, fmt.Sprintf("%d", obj.Size()), contentType, string(status)})
 		}
 	}
 
@@ -2302,6 +2480,7 @@ func scanOnly(src, dst object.ObjectStorage) error {
 		total, matches, differs, missing, errors, time.Since(startTime))
 
 	// Phase 2: detect extra objects on destination
+	// No in-memory srcKeys map — use streaming approach
 	dstObjects, dstErr := listAll(dst, "", "", "", true, true)
 	if dstErr == nil {
 		for obj := range dstObjects {
@@ -2309,7 +2488,8 @@ func scanOnly(src, dst object.ObjectStorage) error {
 				break
 			}
 			key := obj.Key()
-			if !srcKeys[key] {
+			// Check if src has this key by doing a Head (cheap for most stores)
+			if _, srcErr := src.Head(ctx, key); srcErr != nil {
 				extras++
 				_ = syncDbService.RecordObject(sync_db.ObjectRecord{
 					JobID:     syncDbJobID,
@@ -2324,16 +2504,16 @@ func scanOnly(src, dst object.ObjectStorage) error {
 		logger.Infof("Extra objects on destination: %d", extras)
 	}
 
-	// End job
+	// Flush async records before marking the job completed.
 	_ = syncDbService.Close()
 	_ = syncDbService.EndJob(syncDbJobID, sync_db.JobInfo{
-		ID:          syncDbJobID,
-		Status:      sync_db.JobCompleted,
-		EndTime:     time.Now(),
-		TotalObjects: total,
-		CopiedObjects: matches,
+		ID:             syncDbJobID,
+		Status:         sync_db.JobCompleted,
+		EndTime:        time.Now(),
+		TotalObjects:   total,
+		CopiedObjects:  matches,
 		SkippedObjects: differs,
-		FailedObjects: errors,
+		FailedObjects:  errors,
 		DeletedObjects: missing,
 	})
 	return nil
@@ -2360,10 +2540,6 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		}
 	}()
 
-	if config.Dashboard != "" {
-		startDashboard(config.Dashboard)
-	}
-
 	// Initialize db service if configured
 	if config.DbDSN != "" {
 		cfg, err := sync_db.ParseDbDSN(config.DbDSN)
@@ -2380,6 +2556,32 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 			}
 		}
 	}
+
+	// ---- 双层门卫初始化 ----
+	if config.DbDSN != "" && !config.Scan && !config.ScanSingle {
+		table := sync_db.ResolveGateTableName(config.GateTable, src.String(), dst.String())
+		gs, err := sync_db.NewGateService(config.DbDSN, table)
+		if err != nil {
+			logger.Warnf("Failed to init gate service: %v, falling back to no gate", err)
+		} else {
+			gateSvc = gs
+			defer gs.Close()
+			gateBuf = NewGateRecordBuffer(gs, 500, time.Second)
+			logger.Infof("Two-layer gate enabled with table: %s", table)
+		}
+	}
+	// ------------------------
+	defer func() {
+		if gateBuf != nil {
+			if err := gateBuf.Close(); err != nil {
+				logger.Warnf("Failed to flush gate records: %v", err)
+			} else {
+				logger.Infof("Gate records flushed to DB")
+			}
+		}
+		gateBuf = nil
+		gateSvc = nil
+	}()
 
 	// Scan-single mode: list one bucket, record metadata via ListObjects only
 	if config.ScanSingle {
@@ -2414,9 +2616,19 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 			StartTime: time.Now(),
 			Status:    sync_db.JobRunning,
 		}); err != nil {
-			logger.Errorf("Failed to start db job: %v", err)
+			return fmt.Errorf("failed to start scan db job: %w", err)
 		}
+		defer func() {
+			_ = syncDbService.Close()
+		}()
 		return scanOnly(src, dst)
+	}
+
+	// Fix-meta mode: only update Content-Type/metadata, no data copy. It must
+	// return before the normal sync pipeline starts producers/workers.
+	if config.FixMeta {
+		logger.Infof("Running fix-meta mode...")
+		return fixMetaOnly(src, dst)
 	}
 
 	// Start db job for normal sync
@@ -2428,7 +2640,7 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 			StartTime: time.Now(),
 			Status:    sync_db.JobRunning,
 		}); err != nil {
-			logger.Errorf("Failed to start db job: %v", err)
+			return fmt.Errorf("failed to start sync db job: %w", err)
 		}
 	}
 
@@ -2451,7 +2663,7 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 				if checkpointMgr.ValidateConfig(config) {
 					if len(ckpt.PrefixState) > 0 || len(ckpt.MultipartUploads) > 0 || len(ckpt.SrcDelayDel) > 0 || len(ckpt.DstDelayDel) > 0 {
 						checkpoint = ckpt
-						config.Limit = ckpt.Config.Limit
+						atomic.StoreInt64(&config.Limit, ckpt.Config.Limit)
 						ckpt.Config = config
 						if len(ckpt.SrcDelayDel) > 0 {
 							logger.Infof("Checkpoint has %d pending deletes in source", len(ckpt.SrcDelayDel))
@@ -2520,12 +2732,23 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		localLimit = ratelimit.NewBucketWithRate(bps, int64(bps)/10)
 	}
 	var gLimit *globalLimit
+	var checkBalanceDone chan struct{}
+	var pendingDone chan struct{}
+	var progressDone chan struct{}
+	var failureDone chan struct{}
 	if config.TrafficControlURL != "" {
 		gLimit = &globalLimit{address: config.TrafficControlURL}
+		checkBalanceDone = make(chan struct{})
 		go func() {
+			ticker := time.NewTicker(time.Millisecond * 10)
+			defer ticker.Stop()
 			for {
-				time.Sleep(time.Millisecond * 10)
-				gLimit.checkBalance()
+				select {
+				case <-ticker.C:
+					gLimit.checkBalance()
+				case <-checkBalanceDone:
+					return
+				}
 			}
 		}()
 	}
@@ -2536,7 +2759,25 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		}
 	}
 
-	progress := utils.NewProgress(config.Verbose || config.Quiet || config.Manager != "")
+	noProgressBar := config.Verbose || config.Quiet || config.Manager != ""
+	progress := utils.NewProgress(noProgressBar)
+	if noProgressBar {
+		// 无进度条模式下，每 10 秒打印一次文本进度到 stderr
+		progressDone = make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					logger.Infof("Progress: scanned=%d copied=%d (%s) skipped=%d",
+						handled.GetTotal(), copied.Current(), formatSize(copiedBytes.Current()), skipped.Current())
+				case <-progressDone:
+					return
+				}
+			}
+		}()
+	}
 	handled = progress.AddCountBar("Scanned objects", 0)
 	excluded = progress.AddCountSpinner("Excluded objects")
 	excludedBytes = progress.AddByteSpinner("Excluded bytes")
@@ -2607,6 +2848,9 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 			incrHandled(0)
 			total := handled.GetTotal()
 			progress.Done()
+			if checkBalanceDone != nil {
+				close(checkBalanceDone)
+			}
 
 			msg := fmt.Sprintf("Found: %d, excluded: %d (%s), skipped: %d (%s), copied: %d (%s), extra: %d (%s)", total,
 				excluded.Current(), formatSize(excludedBytes.Current()),
@@ -2641,12 +2885,21 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 					TotalObjects:   handled.GetTotal(),
 					CopiedObjects:  copied.Current(),
 					SkippedObjects: skipped.Current(),
-					FailedObjects:  func() int64 { if failed != nil { return failed.Current() }; return 0 }(),
-					DeletedObjects: func() int64 { if deleted != nil { return deleted.Current() }; return 0 }(),
-					TotalBytes:     copiedBytes.Current(),
+					FailedObjects: func() int64 {
+						if failed != nil {
+							return failed.Current()
+						}
+						return 0
+					}(),
+					DeletedObjects: func() int64 {
+						if deleted != nil {
+							return deleted.Current()
+						}
+						return 0
+					}(),
+					TotalBytes: copiedBytes.Current(),
 				})
 			}
-
 
 			if failed != nil {
 				if n := failed.Current(); n > 0 || total > handled.Current()+extra.Current() {
@@ -2676,14 +2929,21 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 	if !config.Dry {
 		failed = progress.AddCountSpinner("Failed objects")
 		if config.MaxFailure > 0 {
+			failureDone = make(chan struct{})
 			go func() {
+				ticker := time.NewTicker(time.Millisecond * 100)
+				defer ticker.Stop()
 				for {
-					if failed.Current() >= config.MaxFailure {
-						logger.Infof("the maximum error limit of %d was reached, stop now", config.MaxFailure)
-						_ = syncExitFunc()
-						os.Exit(1)
+					select {
+					case <-ticker.C:
+						if failed.Current() >= config.MaxFailure {
+							logger.Infof("the maximum error limit of %d was reached, stop now", config.MaxFailure)
+							_ = syncExitFunc()
+							os.Exit(1)
+						}
+					case <-failureDone:
+						return
 					}
-					time.Sleep(time.Millisecond * 100)
 				}
 			}()
 		}
@@ -2693,10 +2953,17 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		listedPrefix = progress.AddCountSpinner("Prefix")
 	}
 
+	pendingDone = make(chan struct{})
 	go func() {
+		ticker := time.NewTicker(time.Millisecond * 100)
+		defer ticker.Stop()
 		for {
-			pending.SetCurrent(int64(len(tasks)))
-			time.Sleep(time.Millisecond * 100)
+			select {
+			case <-ticker.C:
+				pending.SetCurrent(int64(len(tasks)))
+			case <-pendingDone:
+				return
+			}
 		}
 	}()
 
@@ -2721,7 +2988,7 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 			}
 			launchWorker(addr, config, &wg)
 		}
-		logger.Infof("Syncing from %q to %q", src, dst)
+		logger.Infof("Syncing from %q to %q", maskStorageURL(src), maskStorageURL(dst))
 		if config.Start != "" {
 			logger.Infof("first key: %q", config.Start)
 		}
@@ -2744,14 +3011,32 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		close(tasks)
 	} else {
 		go fetchJobs(tasks, config, uploads)
+		statsDone := make(chan struct{})
+		defer close(statsDone)
 		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
 			for {
-				sendStats(config.Manager, workerUploads)
-				time.Sleep(time.Second)
+				select {
+				case <-ticker.C:
+					sendStats(config.Manager, workerUploads)
+				case <-statsDone:
+					return
+				}
 			}
 		}()
 	}
 	wg.Wait()
+
+	if pendingDone != nil {
+		close(pendingDone)
+	}
+	if progressDone != nil {
+		close(progressDone)
+	}
+	if failureDone != nil {
+		close(failureDone)
+	}
 
 	if checkpointMgr != nil {
 		checkpointMgr.Stop()
@@ -2785,16 +3070,13 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		}()
 		delWg.Wait()
 	}
-	// Fix-meta mode: only update Content-Type/metadata, no data copy
-	if config.FixMeta {
-		logger.Infof("Running fix-meta mode...")
-		return fixMetaOnly(src, dst)
-	}
-
-	// Retry failed: only sync previously failed objects
-	if config.RetryFailed && syncDbService != nil {
-		logger.Infof("Retrying failed objects from DB...")
-		return retryFailedObjects(src, dst)
+	// Retry failed: with --db/gate enabled, previously failed objects are sent to
+	// the second gate again while successful unchanged objects are skipped by the first gate.
+	if config.RetryFailed {
+		if syncDbService == nil {
+			return fmt.Errorf("--retry-failed requires --db")
+		}
+		logger.Infof("Retry-failed mode: failed gate records will be re-attempted during normal sync")
 	}
 
 	// Double check: second pass to catch objects added during first pass
@@ -2806,20 +3088,7 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 	return syncExitFunc()
 }
 
-
 // fixMetaOnly fixes Content-Type and metadata on destination without re-copying data.
-
-// retryFailedObjects re-syncs failed objects from the previous sync job.
-func retryFailedObjects(src, dst object.ObjectStorage) error {
-	// Read failed object keys from the current sync_job in the DB
-	// They'll be re-copied as part of the normal sync flow
-	logger.Infof("Retry-failed mode: will re-attempt previously failed objects")
-	// Simply fall through to normal sync — failed objects will be picked up
-	return nil
-}
-
-
-
 func fixMetaOnly(src, dst object.ObjectStorage) error {
 	srcObjects, err := listAll(src, "", "", "", true, true)
 	if err != nil {
@@ -2828,7 +3097,9 @@ func fixMetaOnly(src, dst object.ObjectStorage) error {
 	var fixed, skipped, errors int64
 	startTime := time.Now()
 	for obj := range srcObjects {
-		if obj == nil { break }
+		if obj == nil {
+			break
+		}
 		key := obj.Key()
 		srcMeta, _ := getSrcMeta(src, key)
 		dstObj, dstErr := dst.Head(ctx, key)
@@ -2843,27 +3114,30 @@ func fixMetaOnly(src, dst object.ObjectStorage) error {
 		// Check if metadata differs
 		dstCT := dstObj.ContentType()
 		srcCT := srcMeta.ContentType
-		if srcCT == "" { srcCT = "" } // ensure non-nil comparison
 		if dstCT == srcCT {
 			skipped++
 			continue
 		}
-		// Use CopyObject to update metadata (S3 copy-on-self with metadata override)
-		if err := dst.Copy(ctx, key, key); err != nil {
-			// Fallback: re-put with PutWithMeta
-			if mp, ok := dst.(object.MetadataPutter); ok {
-				reader, getErr := src.Get(ctx, key, 0, obj.Size())
-				if getErr == nil {
-					defer reader.Close()
-					mp.PutWithMeta(ctx, key, reader, object.ObjectMeta{ContentType: srcCT, Metadata: srcMeta.Metadata})
-					fixed++
-					continue
-				}
-			}
+		// Re-put with explicit metadata. A self CopyObject is not reliable here:
+		// with MetadataDirectiveCopy it preserves the old metadata and can report
+		// success without changing Content-Type.
+		mp, ok := dst.(object.MetadataPutter)
+		if !ok {
+			logger.Warnf("fix-meta: destination does not support PutWithMeta for %s", key)
 			errors++
-		} else {
-			fixed++
+			continue
 		}
+		reader, getErr := src.Get(ctx, key, 0, obj.Size())
+		if getErr != nil {
+			errors++
+			continue
+		}
+		if putErr := mp.PutWithMeta(ctx, key, reader, object.ObjectMeta{ContentType: srcCT, Metadata: srcMeta.Metadata}); putErr == nil {
+			fixed++
+		} else {
+			errors++
+		}
+		reader.Close()
 	}
 	logger.Infof("Fix-meta complete: fixed %d, skipped %d, errors %d in %s", fixed, skipped, errors, time.Since(startTime))
 	return nil
@@ -2874,7 +3148,7 @@ func doubleCheckPass0(src, dst object.ObjectStorage) error {
 	if err != nil {
 		return err
 	}
-	var copied, skipped int64
+	var dcCopied, dcSkipped int64
 	startTime := time.Now()
 	for obj := range srcObjects {
 		if obj == nil {
@@ -2883,17 +3157,26 @@ func doubleCheckPass0(src, dst object.ObjectStorage) error {
 		key := obj.Key()
 		dstObj, dstErr := dst.Head(ctx, key)
 		if dstErr == nil && dstObj.Size() == obj.Size() {
-			skipped++
+			dcSkipped++
 			continue
 		}
 		_, err := copyData(src, dst, key, obj.Size(), obj.Mtime(), false, nil)
 		if err != nil {
 			logger.Errorf("Double-check: failed to copy %s: %v", key, err)
 		} else {
-			copied++
+			dcCopied++
 		}
 	}
-	logger.Infof("Double-check complete: copied %d, skipped %d in %s", copied, skipped, time.Since(startTime))
+	if copied != nil {
+		copied.IncrInt64(dcCopied)
+	}
+	if copiedBytes != nil {
+		// bytes already updated by copyData, nothing extra needed
+	}
+	if skipped != nil {
+		skipped.IncrInt64(dcSkipped)
+	}
+	logger.Infof("Double-check complete: copied %d, skipped %d in %s", dcCopied, dcSkipped, time.Since(startTime))
 	return nil
 }
 

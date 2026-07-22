@@ -214,11 +214,13 @@ func (s *s3client) put(ctx context.Context, key string, in io.Reader, meta Objec
 func (s *s3client) Copy(ctx context.Context, dst, src string) error {
 	sc := getOrDefaultScValue(s.GetStorageClass(ctx), string(types.StorageClassStandard))
 	src = s.bucket + "/" + src
+	directive := types.MetadataDirectiveCopy
 	params := &s3.CopyObjectInput{
-		Bucket:       &s.bucket,
-		Key:          &dst,
-		CopySource:   &src,
-		StorageClass: types.StorageClass(sc),
+		Bucket:            &s.bucket,
+		Key:               &dst,
+		CopySource:        &src,
+		StorageClass:      types.StorageClass(sc),
+		MetadataDirective: directive,
 	}
 	_, err := s.s3.CopyObject(ctx, params)
 	return err

@@ -360,6 +360,25 @@ func (e *encrypted) Put(ctx context.Context, key string, in io.Reader, getters .
 	return e.ObjectStorage.Put(ctx, key, bytes.NewReader(ciphertext), getters...)
 }
 
+// PutWithMeta encrypts the payload and preserves metadata when the underlying
+// storage supports it. Without this method, *encrypted does not satisfy the
+// MetadataPutter interface and callers silently fall back to plain Put, losing
+// all custom metadata.
+func (e *encrypted) PutWithMeta(ctx context.Context, key string, in io.Reader, meta ObjectMeta, getters ...AttrGetter) error {
+	plain, err := io.ReadAll(in)
+	if err != nil {
+		return err
+	}
+	ciphertext, err := e.enc.Encrypt(plain)
+	if err != nil {
+		return err
+	}
+	if mp, ok := e.ObjectStorage.(MetadataPutter); ok {
+		return mp.PutWithMeta(ctx, key, bytes.NewReader(ciphertext), meta, getters...)
+	}
+	return e.ObjectStorage.Put(ctx, key, bytes.NewReader(ciphertext), getters...)
+}
+
 func (e *encrypted) SetTier(init Tiers) error {
 	if o, ok := e.ObjectStorage.(SupportTier); ok {
 		if err := o.SetTier(init); err != nil {

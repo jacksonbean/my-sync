@@ -1,6 +1,7 @@
 package db
 
 import (
+	"crypto/md5"
 	"fmt"
 	"net/url"
 	"strings"
@@ -37,7 +38,7 @@ const (
 
 // JobInfo holds summary info for a sync job.
 type JobInfo struct {
-	ID             string // dest_bucket_202606031430
+	ID             string // dest_bucket_20260603143015123456
 	SrcURL         string
 	DstURL         string
 	StartTime      time.Time
@@ -71,38 +72,59 @@ type DbConfig struct {
 	Host   string // host:port
 	User   string
 	Pass   string
+	DBName string // database name from the URL path (e.g. mysql://user:pass@host/db)
 }
 
 // GenerateJobID creates a job ID from the destination bucket name and current time.
+// The timestamp includes microseconds to avoid collisions between consecutive runs
+// started within the same minute.
 func GenerateJobID(dstURL string, t time.Time) string {
-	u, err := url.Parse(dstURL)
-	if err != nil {
-		dstURL = strings.TrimPrefix(dstURL, "s3://")
-		dstURL = strings.TrimPrefix(dstURL, "cos://")
-		dstURL = strings.TrimPrefix(dstURL, "oss://")
-		dstURL = strings.TrimSuffix(dstURL, "/")
-		parts := strings.Split(dstURL, "/")
-		bucket := parts[0]
-		if idx := strings.Index(bucket, "."); idx > 0 {
-			bucket = bucket[:idx]
+	jobTime := t.Format("20060102150405") + fmt.Sprintf("%06d", t.Nanosecond()/1000)
+	name := ""
+	if u, err := url.Parse(dstURL); err == nil && u.Host != "" {
+		name = u.Host
+		if idx := strings.Index(name, "."); idx > 0 {
+			name = name[:idx]
 		}
-		return fmt.Sprintf("%s_%s", bucket, t.Format("200601021504"))
+		if path := strings.Trim(u.Path, "/"); path != "" {
+			name += "_" + strings.ReplaceAll(path, "/", "_")
+		}
+	} else {
+		trimmed := strings.TrimPrefix(dstURL, "s3://")
+		trimmed = strings.TrimPrefix(trimmed, "cos://")
+		trimmed = strings.TrimPrefix(trimmed, "oss://")
+		trimmed = strings.TrimSuffix(trimmed, "/")
+		parts := strings.Split(trimmed, "/")
+		name = parts[0]
+		if idx := strings.Index(name, "."); idx > 0 {
+			name = name[:idx]
+		}
 	}
-	host := u.Host
-	if idx := strings.Index(host, "."); idx > 0 {
-		host = host[:idx]
+	name = strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			return r
+		}
+		return '_'
+	}, name)
+	name = strings.Trim(name, "_")
+	if name == "" {
+		name = "job"
 	}
-	path := strings.Trim(u.Path, "/")
-	if path != "" {
-		host = host + "_" + strings.ReplaceAll(path, "/", "_")
+	// MySQL table names are limited to 64 chars. StartJob prefixes the ID with
+	// "objects_", so keep the ID comfortably below that limit even for local
+	// paths or long bucket/endpoint combinations.
+	if len(name) > 32 {
+		hash := fmt.Sprintf("%x", md5.Sum([]byte(dstURL)))
+		name = name[:16] + "_" + hash[:8]
 	}
-	return fmt.Sprintf("%s_%s", host, t.Format("200601021504"))
+	return fmt.Sprintf("%s_%s", name, jobTime)
 }
 
 // DbService is the interface for recording sync results.
 type DbService interface {
 	StartJob(job JobInfo) error
 	RecordObject(rec ObjectRecord) error
+	RecordObjects(recs []ObjectRecord) error
 	EndJob(jobID string, job JobInfo) error
 	Close() error
 }
@@ -123,11 +145,13 @@ func ParseDbDSN(raw string) (*DbConfig, error) {
 	if !strings.Contains(host, ":") {
 		host += ":3306"
 	}
+	dbName := strings.Trim(u.Path, "/")
 	return &DbConfig{
 		Driver: driver,
 		Host:   host,
 		User:   u.User.Username(),
 		Pass:   pass,
+		DBName: dbName,
 	}, nil
 }
 
@@ -135,7 +159,8 @@ func ParseDbDSN(raw string) (*DbConfig, error) {
 const channelSize = 50000
 
 // batchSize is the number of records to accumulate before flushing to DB.
-const batchSize = 100
+// For scan-single (millions of objects), a larger batch reduces round trips.
+const batchSize = 500
 
 // flushInterval is the max time between batch flushes.
 const flushInterval = time.Second
@@ -143,12 +168,13 @@ const flushInterval = time.Second
 // AsyncDbService wraps a DbService with a buffered channel, batch writes, and non-blocking sends.
 type AsyncDbService struct {
 	DbService
-	ch     chan ObjectRecord
-	wg     sync.WaitGroup
-	closed bool
-	mu     sync.Mutex
-	errors []error
-	batch  []ObjectRecord
+	ch           chan ObjectRecord
+	wg           sync.WaitGroup
+	closed       bool
+	mu           sync.Mutex
+	errors       []error
+	batch        []ObjectRecord
+	flushRetries int
 }
 
 // NewAsyncDbService creates an AsyncDbService that buffers and batch-writes object records.
@@ -171,7 +197,12 @@ func (a *AsyncDbService) worker() {
 		select {
 		case rec, ok := <-a.ch:
 			if !ok {
-				a.flushBatch()
+				// Final flush: no more records will arrive, so retry the remaining
+				// batch immediately instead of waiting for a future tick that will
+				// never come. flushBatch drops the batch after 3 failed attempts.
+				for len(a.batch) > 0 {
+					a.flushBatch()
+				}
 				return
 			}
 			a.batch = append(a.batch, rec)
@@ -190,19 +221,33 @@ func (a *AsyncDbService) flushBatch() {
 	if len(a.batch) == 0 {
 		return
 	}
-	for _, rec := range a.batch {
-		if err := a.DbService.RecordObject(rec); err != nil {
+	if err := a.DbService.RecordObjects(a.batch); err != nil {
+		a.mu.Lock()
+		a.errors = append(a.errors, err)
+		a.flushRetries++
+		retries := a.flushRetries
+		a.mu.Unlock()
+		if retries >= 3 {
+			logger.Warnf("Dropping %d records after %d failed attempts: %s", len(a.batch), retries, err)
+			a.batch = a.batch[:0]
 			a.mu.Lock()
-			a.errors = append(a.errors, err)
+			a.flushRetries = 0
 			a.mu.Unlock()
-			logger.Errorf("Failed to record object %s: %s", rec.SourceKey, err)
+		} else {
+			logger.Errorf("Failed to batch record %d objects: %s, will retry on next flush", len(a.batch), err)
 		}
+		return
 	}
+	a.mu.Lock()
+	a.flushRetries = 0
+	a.mu.Unlock()
 	a.batch = a.batch[:0]
 }
 
 func sendSafe(ch chan ObjectRecord, rec ObjectRecord) (sent bool) {
-	defer func() { recover() }()
+	// The select with a default never panics on a closed (or nil) channel,
+	// so no recover is needed. Swallowing arbitrary panics here would mask
+	// real programming errors.
 	select {
 	case ch <- rec:
 		return true
@@ -212,11 +257,13 @@ func sendSafe(ch chan ObjectRecord, rec ObjectRecord) (sent bool) {
 }
 
 // RecordObject sends an object record to the async channel (non-blocking).
+// Returns an error if the record was dropped due to a full channel.
 func (a *AsyncDbService) RecordObject(rec ObjectRecord) error {
 	if !sendSafe(a.ch, rec) {
 		a.mu.Lock()
 		a.errors = append(a.errors, fmt.Errorf("RecordObject dropped: %s", rec.SourceKey))
 		a.mu.Unlock()
+		return fmt.Errorf("record dropped (channel full): %s", rec.SourceKey)
 	}
 	return nil
 }
@@ -224,10 +271,12 @@ func (a *AsyncDbService) RecordObject(rec ObjectRecord) error {
 // Close flushes remaining records and shuts down the worker.
 func (a *AsyncDbService) Close() error {
 	a.mu.Lock()
-	if !a.closed {
-		a.closed = true
-		close(a.ch)
+	if a.closed {
+		a.mu.Unlock()
+		return nil
 	}
+	a.closed = true
+	close(a.ch)
 	a.mu.Unlock()
 	a.wg.Wait()
 	a.mu.Lock()

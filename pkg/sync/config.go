@@ -21,6 +21,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -79,10 +80,11 @@ type Config struct {
 	CheckpointForceReset bool
 	PreserveMeta         bool
 	DbDSN                string
+	GateTable            string
 	Scan                 bool
 	ScanSingle           bool
 	OutputFile           string
-	Dashboard            string
+	// Dashboard removed
 	DoubleCheck          bool
 	FixMeta              bool
 	RetryFailed          bool
@@ -90,6 +92,11 @@ type Config struct {
 	rules          []rule
 	concurrentList chan int              `json:"-"`
 	Registerer     prometheus.Registerer `json:"-"`
+}
+
+// LimitDecr atomically decrements the Limit counter.
+func (c *Config) LimitDecr() {
+	atomic.AddInt64(&c.Limit, -1)
 }
 
 const JFS_UMASK = "JFS_UMASK"
@@ -232,10 +239,10 @@ func NewConfigFromCli(c *cli.Context) *Config {
 		CheckpointForceReset: c.Bool("checkpoint-force-reset"),
 		PreserveMeta:         c.Bool("preserve-meta"),
 		DbDSN:                c.String("db"),
+		GateTable:            c.String("gate-table"),
 		Scan:                 c.Bool("scan"),
 		ScanSingle:           c.Bool("scan-single"),
 		OutputFile:           c.String("output"),
-		Dashboard:            c.String("dashboard"),
 		DoubleCheck:          c.Bool("double-check"),
 		FixMeta:              c.Bool("fix-meta"),
 		RetryFailed:         c.Bool("retry-failed"),

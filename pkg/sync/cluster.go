@@ -499,6 +499,9 @@ func unmarshalObjects(d []byte) ([]object.Object, error) {
 	var objs []object.Object
 	for _, m := range arr {
 		obj := object.UnmarshalObject(m)
+		if obj == nil {
+			continue
+		}
 		if nsize, ok := m["nsize"]; ok {
 			obj = withSize(obj, int64(nsize.(float64)))
 		}

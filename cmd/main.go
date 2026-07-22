@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"net/http"
+
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/urfave/cli/v2"
 )
 
@@ -17,7 +20,6 @@ func Main(args []string) error {
 		Copyright: "Apache 2.0",
 		Commands: []*cli.Command{
 			cmdSync(),
-			cmdDashboard(),
 		},
 		Flags: globalFlags(),
 	}
@@ -59,10 +61,22 @@ func setup(c *cli.Context, n int) {
 }
 
 func exposeMetrics(c *cli.Context, registerer prometheus.Registerer, registry *prometheus.Registry) string {
-	return "127.0.0.1:9567"
+	addr := c.String("metrics")
+	if addr == "" {
+		return ""
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	go func() {
+		logger.Infof("metrics server listening on %s", addr)
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			logger.Warnf("metrics server error: %v", err)
+		}
+	}()
+	return addr
 }
 
-func removePassword(srcURL, dstURL string) {}
+// removePassword is deprecated; use utils.RemovePassword for credential masking.
 
 func expandFlags(flags ...[]cli.Flag) []cli.Flag {
 	var result []cli.Flag

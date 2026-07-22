@@ -803,21 +803,6 @@ func TestParseFilterRule(t *testing.T) {
 	}
 }
 
-type mockObject struct {
-	size  int64
-	mtime time.Time
-}
-
-func (o *mockObject) Key() string              { return "" }
-func (o *mockObject) IsDir() bool              { return false }
-func (o *mockObject) IsSymlink() bool          { return false }
-func (o *mockObject) Size() int64              { return o.size }
-func (o *mockObject) Mtime() time.Time         { return o.mtime }
-func (o *mockObject) StorageClass() string     { return "" }
-func (o *mockObject) Status() string           { return "" }
-func (o *mockObject) ContentType() string      { return "" }
-func (o *mockObject) Metadata() map[string]string { return nil }
-
 func TestFilterSizeAndAge(t *testing.T) {
 	config := &Config{
 		MaxSize: 100,
@@ -826,10 +811,10 @@ func TestFilterSizeAndAge(t *testing.T) {
 		MinAge:  time.Second * 10,
 	}
 	now := time.Now()
-	if !filterKey(&mockObject{10, now.Add(-time.Second * 15)}, now, nil, config) {
+	if !filterKey(&mockObject{size: 10, mtime: now.Add(-time.Second * 15)}, now, nil, config) {
 		t.Fatalf("filterKey failed")
 	}
-	if filterKey(&mockObject{200, now.Add(-time.Second * 200)}, now, nil, config) {
+	if filterKey(&mockObject{size: 200, mtime: now.Add(-time.Second * 200)}, now, nil, config) {
 		t.Fatalf("filterKey should fail")
 	}
 
@@ -838,11 +823,11 @@ func TestFilterSizeAndAge(t *testing.T) {
 		StartTime: time.Now().Add(-time.Hour),
 		EndTime:   time.Now().Add(-time.Minute),
 	}
-	if !filterKey(&mockObject{200, now.Add(-time.Minute * 30)}, now, nil, config) {
+	if !filterKey(&mockObject{size: 200, mtime: now.Add(-time.Minute * 30)}, now, nil, config) {
 		t.Fatalf("filterKey fail")
 	}
 
-	if filterKey(&mockObject{200, now.Add(-time.Hour * 2)}, now, nil, config) {
+	if filterKey(&mockObject{size: 200, mtime: now.Add(-time.Hour * 2)}, now, nil, config) {
 		t.Fatalf("filterKey should fail")
 	}
 }

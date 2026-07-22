@@ -38,8 +38,8 @@ func NewMySQLService(cfg *DbConfig, isScan, isSingleScan bool) (DbService, error
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(3)
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	if err := db.Ping(); err != nil {
@@ -56,8 +56,14 @@ func NewMySQLService(cfg *DbConfig, isScan, isSingleScan bool) (DbService, error
 }
 
 func (s *mysqlService) createDatabases() error {
-	dbs := []string{dbSyncJobs, dbSyncData, dbScanJobs, dbScanData, dbSingleScanJobs, dbSingleScan}
+	// Only create the databases we actually need
+	dbs := []string{s.jobsDB(), s.dataDB()}
+	seen := map[string]bool{}
 	for _, name := range dbs {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
 		if _, err := s.db.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", name)); err != nil {
 			return fmt.Errorf("create database %s: %w", name, err)
 		}
@@ -114,9 +120,16 @@ func (s *mysqlService) createSingleScanTable(tableName string) error {
 		last_modified DATETIME(3),
 		storage_class VARCHAR(64),
 		INDEX idx_key (source_key(768))
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, s.dataDB(), tableName)
+	) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4`, s.dataDB(), tableName)
 	_, err := s.db.Exec(sql)
-	return err
+	if err != nil {
+		return err
+	}
+	// Session optimizations (unique_checks, foreign_key_checks) are applied
+	// per-batch inside recordObjectsSingleScan via a transaction, so every
+	// connection in the pool benefits regardless of which connection serves
+	// the Exec call.
+	return nil
 }
 
 func (s *mysqlService) createObjectsTable(tableName string) error {
@@ -228,6 +241,108 @@ func (s *mysqlService) RecordObject(rec ObjectRecord) error {
 		rec.ContentType, rec.Metadata, string(rec.Status), rec.ErrorMsg,
 		rec.StartTime, rec.EndTime)
 	return err
+}
+
+// RecordObjects performs a multi-row batch INSERT for multiple object records.
+func (s *mysqlService) RecordObjects(recs []ObjectRecord) error {
+	if len(recs) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	table := s.objectsTable
+	s.mu.Unlock()
+	if table == "" {
+		return fmt.Errorf("no active job")
+	}
+
+	if s.isSingleScan {
+		return s.recordObjectsSingleScan(recs, table)
+	}
+	return s.recordObjectsSync(recs, table)
+}
+
+func (s *mysqlService) recordObjectsSingleScan(recs []ObjectRecord, table string) error {
+	const chunkSize = 500
+	for i := 0; i < len(recs); i += chunkSize {
+		end := i + chunkSize
+		if end > len(recs) {
+			end = len(recs)
+		}
+		batch := recs[i:end]
+
+		// Use a transaction to guarantee the session-level bulk-load optimizations
+		// apply to whichever connection the pool hands us for this batch.
+		tx, err := s.db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin tx for single scan batch: %w", err)
+		}
+		if _, err := tx.Exec("SET unique_checks = 0"); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("set unique_checks: %w", err)
+		}
+		if _, err := tx.Exec("SET foreign_key_checks = 0"); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("set foreign_key_checks: %w", err)
+		}
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("INSERT INTO `%s`.`%s` (source_key, size, last_modified, storage_class) VALUES ", s.dataDB(), table))
+		args := make([]interface{}, 0, len(batch)*4)
+		for j, rec := range batch {
+			if j > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString("(?, ?, ?, ?)")
+			args = append(args, rec.SourceKey, rec.Size, rec.EndTime, rec.ContentType)
+		}
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("batch insert single scan: %w", err)
+		}
+		// Restore session-level settings so the connection returned to the
+		// pool does not leak disabled checks to unrelated later statements.
+		if _, err := tx.Exec("SET unique_checks = 1"); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("reset unique_checks: %w", err)
+		}
+		if _, err := tx.Exec("SET foreign_key_checks = 1"); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("reset foreign_key_checks: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit single scan batch: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *mysqlService) recordObjectsSync(recs []ObjectRecord, table string) error {
+	const chunkSize = 200
+	for i := 0; i < len(recs); i += chunkSize {
+		end := i + chunkSize
+		if end > len(recs) {
+			end = len(recs)
+		}
+		batch := recs[i:end]
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("INSERT INTO `%s`.`%s` (source_key, target_key, size, content_type, metadata_json, status, error_msg, start_time, end_time) VALUES ", s.dataDB(), table))
+		args := make([]interface{}, 0, len(batch)*9)
+		for j, rec := range batch {
+			if j > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString("(?, ?, ?, ?, ?, ?, ?, ?, ?)")
+			args = append(args, rec.SourceKey, rec.TargetKey, rec.Size,
+				rec.ContentType, rec.Metadata, string(rec.Status), rec.ErrorMsg,
+				rec.StartTime, rec.EndTime)
+		}
+		_, err := s.db.Exec(sb.String(), args...)
+		if err != nil {
+			return fmt.Errorf("batch insert sync: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *mysqlService) EndJob(jobID string, job JobInfo) error {

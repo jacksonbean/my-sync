@@ -33,6 +33,9 @@ import (
 	"github.com/viki-org/dnscache"
 )
 
+// minTLSVersion is the minimum TLS version to use for outgoing connections.
+const minTLSVersion = tls.VersionTLS12
+
 var resolver = dnscache.New(time.Minute)
 var httpClient *http.Client
 
@@ -178,7 +181,7 @@ func init() {
 				return dialParallel(ctx, dialer, network, ipv6, ipv4, port)
 			},
 			DisableCompression: true,
-			TLSClientConfig:    &tls.Config{},
+			TLSClientConfig:    &tls.Config{MinVersion: minTLSVersion},
 		},
 		Timeout: time.Hour,
 	}

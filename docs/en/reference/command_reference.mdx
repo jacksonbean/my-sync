@@ -980,7 +980,7 @@ In which:
 |`--links, -l`|Copy symlinks as symlinks default to false.|
 |`--inplace` <VersionAdd>1.2</VersionAdd>|When a file in the source path is modified, directly modify the file with the same name in the destination path instead of first writing a temporary file in the destination path and then atomically renaming the temporary file to the real file name. This option only makes sense when the `--update` option is enabled and the storage system of the destination path supports in-place modification of files (such as JuiceFS, HDFS, NFS). That is to say, if the storage system of the destination path is object storage, enable this option is invalid. (default: false)|
 |`--delete-src, --deleteSrc`|Delete objects that already exist in destination. Different from rsync, files won't be deleted at the first run, instead they will be deleted at the next run, after files are successfully copied to the destination.|
-|`--delete-dst, --deleteDst`|Delete extraneous objects from destination.|
+|`--delete-dst, --deleteDst`|Delete extraneous objects from destination. When `--db`/gate is enabled, objects skipped by the first gate with the same key on destination are not misclassified as extra.|
 |`--check-all`|Verify the integrity of all files in source and destination, default to false. Comparison is done on byte streams, which comes at a performance cost.|
 |`--check-new`|Verify the integrity of newly copied files, default to false. Comparison is done on byte streams, which comes at a performance cost.|
 |`--check-change` <VersionAdd>1.3</VersionAdd>|Verify whether the data has changed before and after synchronization, default is false. Based on file size and mtime, which is lightweight.|
@@ -989,6 +989,15 @@ In which:
 |`--enable-checkpoint`|Enable checkpoint for resumable sync.|
 |`--checkpoint-interval=10s`|Interval at which the checkpoint is saved.|
 |`--checkpoint-force-reset`|Start the sync from scratch and overwrite the existing checkpoint.|
+|`--preserve-meta`|Preserve source Content-Type and user-defined metadata, default to false.|
+|`--db`|Record sync/scan results to MySQL, for example `mysql://user:pass@host:3306/dbname`; when the two-layer gate is enabled, the DSN must include a database name.|
+|`--scan`|Compare source and destination without copying; write results to `--db` or `--output`.|
+|`--scan-single`|Scan a single source bucket only, without accessing destination, and record key/size/mtime/storage_class via ListObjects.|
+|`--output`|Write scan/scan-single results to a CSV file.|
+|`--double-check`|Run a second pass after sync to catch objects added during migration.|
+|`--fix-meta`|Fix Content-Type/metadata for same-size objects without copying data; returns before the normal sync pipeline starts.|
+|`--retry-failed`|Requires `--db`/gate: retries failed/skipped gate records while successful objects with unchanged source mtime are skipped by the first gate.|
+|`--gate-table`|Custom table for two-layer gate records; defaults to `sync_records_v2_<hash>` generated from src/dst.|
 
 #### Storage related options {#sync-storage-related-options}
 

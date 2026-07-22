@@ -975,7 +975,7 @@ juicefs sync --include='a1/b1' --exclude='a*' --include='b2' --exclude='b?' s3:/
 |`--links, -l`|将符号链接复制为符号链接，默认为 false，此时会查找并同步符号链接所指向的文件。|
 |`--inplace` <VersionAdd>1.2</VersionAdd>|当源路径的文件被修改时，直接修改目标路径中的同名文件，而不是先在目标路径中写一个临时文件，再将这个临时文件原子重命名到真实的文件名。这个选项只有当 `--update` 选项开启，以及目标路径的存储系统支持原地修改文件（如 JuiceFS、HDFS、NFS）时才有意义，也就是说如果目标路径的存储系统是对象存储开启这个选项是无效的。（默认值：false）|
 |`--delete-src, --deleteSrc`|如果目标存储已经存在，删除源存储的对象。与 rsync 不同，为保数据安全，首次执行时不会删除源存储文件，只有拷贝成功后再次运行时，扫描确认目标存储已经存在相关文件，才会删除源存储文件。|
-|`--delete-dst, --deleteDst`|删除目标存储下的不相关对象。|
+|`--delete-dst, --deleteDst`|删除目标存储下的不相关对象。启用 `--db`/gate 时，源端被第一层 gate 跳过且目标端同 key 存在的对象不会被误判为 extra。|
 |`--check-all`|校验源路径和目标路径中所有文件的数据完整性，默认为 false。校验方式是基于字节流对比，因此也将带来相应的开销。|
 |`--check-new`|校验新拷贝文件的数据完整性，默认为 false。校验方式是基于字节流对比，因此也将带来相应的开销。|
 |`--check-change` <VersionAdd>1.3</VersionAdd>|校验同步前后的数据是否有变更，默认为 false。校验方式基于文件大小和 mtime，比较轻量。|
@@ -984,6 +984,15 @@ juicefs sync --include='a1/b1' --exclude='a*' --include='b2' --exclude='b?' s3:/
 |`--enable-checkpoint`|启用 checkpoint，用于断点续传。|
 |`--checkpoint-interval=10s`|保存 checkpoint 的时间间隔。|
 |`--checkpoint-force-reset`|从头开始同步，并覆盖已有 checkpoint。|
+|`--preserve-meta`|保留源对象的 Content-Type 和用户自定义 metadata，默认为 false。|
+|`--db`|将同步/扫描结果记录到 MySQL，例如 `mysql://user:pass@host:3306/dbname`；启用两层 gate 时 DSN 需要带 database。|
+|`--scan`|仅对比源和目标，不复制数据，结果写入 `--db` 或 `--output`。|
+|`--scan-single`|仅扫描单个源桶，不访问目标，通过 ListObjects 记录 key/size/mtime/storage_class。|
+|`--output`|将 scan/scan-single 结果输出到 CSV。|
+|`--double-check`|正常同步结束后再执行一遍查漏。|
+|`--fix-meta`|仅修复同 size 对象的 Content-Type/metadata，不复制数据；在正常同步流程前返回。|
+|`--retry-failed`|需配合 `--db`/gate：重试失败/跳过记录，成功且源 mtime 未变的对象由第一层 gate 跳过。|
+|`--gate-table`|指定两层 gate 记录表；默认根据 src/dst 哈希生成 `sync_records_v2_<hash>`。|
 
 #### 对象存储相关参数 {#sync-storage-related-options}
 

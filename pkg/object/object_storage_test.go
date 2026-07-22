@@ -473,7 +473,8 @@ func testStorage(t *testing.T, s ObjectStorage) {
 
 	dstKey := "test-copy"
 	defer s.Delete(ctx, dstKey)
-	err = s.Copy(ctx, fmt.Sprintf("%s%s", prefix, dstKey), fmt.Sprintf("%stest", prefix))
+	// withPrefix.Copy now adds the prefix itself, so pass bare keys
+	err = s.Copy(ctx, dstKey, "test")
 	if err != nil && err != notSupported {
 		t.Fatalf("copy failed: %s", err.Error())
 	}

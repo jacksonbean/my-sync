@@ -261,6 +261,13 @@ func (e *chunkedEncrypted) Put(ctx context.Context, key string, in io.Reader, ge
 	return e.ObjectStorage.Put(ctx, key, e.newChunkEncryptReader(in), getters...)
 }
 
+func (e *chunkedEncrypted) PutWithMeta(ctx context.Context, key string, in io.Reader, meta ObjectMeta, getters ...AttrGetter) error {
+	if mp, ok := e.ObjectStorage.(MetadataPutter); ok {
+		return mp.PutWithMeta(ctx, key, e.newChunkEncryptReader(in), meta, getters...)
+	}
+	return e.Put(ctx, key, in, getters...)
+}
+
 type sizedObj struct {
 	Object
 	size int64

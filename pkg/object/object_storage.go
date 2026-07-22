@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -88,15 +89,57 @@ func MarshalObject(o Object) map[string]interface{} {
 }
 
 func UnmarshalObject(m map[string]interface{}) Object {
-	mtime_int64, _ := strconv.ParseInt(m["mtime"].(string), 10, 64)
-	mtime := time.Unix(0, mtime_int64)
+	key, ok := m["key"].(string)
+	if !ok || key == "" {
+		return nil
+	}
+	mtimeStr, ok := m["mtime"].(string)
+	if !ok {
+		return nil
+	}
+	mtimeInt64, err := strconv.ParseInt(mtimeStr, 10, 64)
+	if err != nil {
+		return nil
+	}
+	var size int64
+	switch v := m["size"].(type) {
+	case float64:
+		size = int64(v)
+	case int64:
+		size = v
+	case int:
+		size = int64(v)
+	case string:
+		size, err = strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil
+		}
+	default:
+		return nil
+	}
+	isDir, _ := m["isdir"].(bool)
 	o := obj{
-		key:   m["key"].(string),
-		size:  int64(m["size"].(float64)),
-		mtime: mtime,
-		isDir: m["isdir"].(bool)}
-	if _, ok := m["mode"]; ok {
-		f := file{o, m["owner"].(string), m["group"].(string), os.FileMode(m["mode"].(float64)), m["isSymlink"].(bool)}
+		key:   key,
+		size:  size,
+		mtime: time.Unix(0, mtimeInt64),
+		isDir: isDir,
+	}
+	if modeRaw, ok := m["mode"]; ok {
+		var mode os.FileMode
+		switch v := modeRaw.(type) {
+		case float64:
+			mode = os.FileMode(v)
+		case int64:
+			mode = os.FileMode(v)
+		case int:
+			mode = os.FileMode(v)
+		default:
+			return nil
+		}
+		owner, _ := m["owner"].(string)
+		group, _ := m["group"].(string)
+		isSymlink, _ := m["isSymlink"].(bool)
+		f := file{o, owner, group, mode, isSymlink}
 		return &f
 	}
 	return &o
@@ -120,7 +163,7 @@ func (s DefaultObjectStorage) Limits() Limits {
 	return Limits{IsSupportMultipartUpload: false, IsSupportUploadPartCopy: false}
 }
 
-func (s DefaultObjectStorage) Head(key string) (Object, error) {
+func (s DefaultObjectStorage) Head(ctx context.Context, key string) (Object, error) {
 	return nil, notSupported
 }
 
@@ -223,6 +266,7 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 	walk = func(prefix string, entries []Object) error {
 		var concurrent = 10
 		var err error
+		var errFlag atomic.Bool // 与 err 配套，供 worker goroutine 无锁检查
 		threads := make([]listThread, concurrent)
 		for c := 0; c < concurrent; c++ {
 			t := &threads[c]
@@ -245,7 +289,7 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 					t.cond.Signal()
 					for t.ready {
 						t.cond.WaitWithTimeout(time.Second)
-						if err != nil {
+						if errFlag.Load() {
 							t.Unlock()
 							return
 						}
@@ -276,6 +320,7 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 			}
 			if t.err != nil {
 				err = t.err
+				errFlag.Store(true)
 				t.Unlock()
 				return err
 			}
@@ -285,6 +330,7 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 				more, t.hasMore, t.nextToken, t.err = store.List(ctx, key, startAfter, t.nextToken, "/", 1e9, followLink)
 				if t.err != nil {
 					err = t.err
+					errFlag.Store(true)
 					t.Unlock()
 					return err
 				}
@@ -298,6 +344,7 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 
 			err = walk(key, children)
 			if err != nil {
+				errFlag.Store(true)
 				return err
 			}
 		}

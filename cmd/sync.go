@@ -28,6 +28,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/metric"
 	"github.com/juicedata/juicefs/pkg/object"
@@ -215,15 +216,15 @@ func syncActionFlags() []cli.Flag {
 		},
 		&cli.BoolFlag{
 			Name:  "retry-failed",
-			Usage: "retry only failed objects from previous sync (requires --db)",
+			Usage: "with --db/gate, re-attempt previously failed objects while unchanged successful objects are skipped by the gate",
+		},
+		&cli.StringFlag{
+			Name:  "gate-table",
+			Usage: "custom table name for two-layer gate sync records (default: auto-generated from src and dst hash). Use this to share gate records across sync runs or multiple workers.",
 		},
 		&cli.StringFlag{
 			Name:  "output",
 			Usage: "output scan results to CSV file (use with --scan or --scan-single)",
-		},
-		&cli.StringFlag{
-			Name:  "dashboard",
-			Usage: "start web dashboard on given address (e.g. :8080)",
 		},
 		&cli.BoolFlag{
 			Name:    "links",
@@ -281,9 +282,9 @@ func syncActionFlags() []cli.Flag {
 			Name:  "checkpoint-force-reset",
 			Usage: "start from scratch and overwrite existing checkpoint",
 		},
-		&cli.StringFlag{
+		&cli.DurationFlag{
 			Name:  "checkpoint-interval",
-			Value: "10s",
+			Value: 10 * time.Second,
 			Usage: "interval to save checkpoint (default: 10s)",
 		},
 	})
@@ -570,7 +571,6 @@ func doSync(c *cli.Context) error {
 	if config.ScanSingle && dstURL == "" {
 		dstURL = srcURL
 	}
-	removePassword(srcURL, dstURL)
 	if runtime.GOOS == "windows" {
 		if !strings.Contains(srcURL, "://") {
 			srcURL = strings.ReplaceAll(srcURL, "\\", "/")
@@ -586,14 +586,12 @@ func doSync(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+	defer object.Shutdown(src)
 	dst, err := createSyncStorage(dstURL, config)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		object.Shutdown(src)
-		object.Shutdown(dst)
-	}()
+	defer object.Shutdown(dst)
 	if config.StorageClass != "" {
 		if os, ok := dst.(object.SupportTier); ok {
 			tiers := object.NewTiers(config.StorageClass)
