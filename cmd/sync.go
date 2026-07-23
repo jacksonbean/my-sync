@@ -177,6 +177,10 @@ func selectionFlags() []cli.Flag {
 			Name:  "files-from",
 			Usage: "read list of files or dirs to sync from FILE",
 		},
+		&cli.StringFlag{
+			Name:  "style",
+			Usage: "S3 addressing style: path or virtual-host (default: auto-detect from URL)",
+		},
 	})
 }
 
@@ -467,6 +471,12 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 	}
 
 	isS3PathTypeUrl := isS3PathType(u.Host)
+	switch conf.Style {
+	case "path":
+		isS3PathTypeUrl = true
+	case "virtual-host":
+		isS3PathTypeUrl = false
+	}
 	if name == "minio" || name == "s3" && isS3PathTypeUrl {
 		// bucket name is part of path
 		endpoint += u.Path
@@ -581,6 +591,19 @@ func doSync(c *cli.Context) error {
 	}
 	if !config.ScanSingle && strings.HasSuffix(srcURL, "/") != strings.HasSuffix(dstURL, "/") {
 		logger.Fatalf("SRC and DST should both end with path separator or not!")
+	}
+	switch config.Style {
+	case "path":
+		t := true
+		object.SetDefaultPathStyle(&t)
+		defer object.ResetDefaultPathStyle()
+	case "virtual-host":
+		t := false
+		object.SetDefaultPathStyle(&t)
+		defer object.ResetDefaultPathStyle()
+	case "":
+	default:
+		logger.Fatalf("invalid --style value %q, supported: path, virtual-host", config.Style)
 	}
 	src, err := createSyncStorage(srcURL, config)
 	if err != nil {

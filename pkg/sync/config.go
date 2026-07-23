@@ -74,6 +74,7 @@ type Config struct {
 	Env               map[string]string `json:"-"`
 
 	FilesFrom string
+	Style     string
 
 	EnableCheckpoint     bool
 	CheckpointInterval   time.Duration
@@ -234,6 +235,7 @@ func NewConfigFromCli(c *cli.Context) *Config {
 		StartTime:            startTime,
 		EndTime:              endTime,
 		FilesFrom:            c.String("files-from"),
+		Style:                c.String("style"),
 		EnableCheckpoint:     c.Bool("enable-checkpoint"),
 		CheckpointInterval:   c.Duration("checkpoint-interval"),
 		CheckpointForceReset: c.Bool("checkpoint-force-reset"),

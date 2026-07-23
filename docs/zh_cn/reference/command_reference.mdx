@@ -965,6 +965,7 @@ juicefs sync --include='a1/b1' --exclude='a*' --include='b2' --exclude='b?' s3:/
 |`--force-update, -f`|强制覆盖已存在的文件，默认为 false。|
 |`--existing, --ignore-non-existing` <VersionAdd>1.1</VersionAdd>|不创建任何新文件，默认为 false。|
 |`--ignore-existing` <VersionAdd>1.1</VersionAdd>|不更新任何已经存在的文件，默认为 false。|
+|`--style`|S3 寻址风格：`path` 或 `virtual-host`。默认根据 URL 格式自动推断。使用此参数可以覆盖自动推断结果。适用于 `s3://` 和 `minio://` 协议。|
 
 #### 行为相关参数 {#sync-action-related-options}
 

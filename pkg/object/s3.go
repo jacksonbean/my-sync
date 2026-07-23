@@ -492,7 +492,18 @@ func parseRegion(endpoint string) string {
 	return region
 }
 
+var forcedPathStyle *bool
+
+// SetDefaultPathStyle overrides the default path-style setting for S3-compatible storage.
+func SetDefaultPathStyle(v *bool) { forcedPathStyle = v }
+
+// ResetDefaultPathStyle clears the override and restores auto-detection behavior.
+func ResetDefaultPathStyle() { forcedPathStyle = nil }
+
 func defaultPathStyle() bool {
+	if forcedPathStyle != nil {
+		return *forcedPathStyle
+	}
 	v := os.Getenv("JFS_S3_VHOST_STYLE")
 	return v == "" || v == "0" || v == "false"
 }
