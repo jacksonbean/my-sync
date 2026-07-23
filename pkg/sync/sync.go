@@ -2101,27 +2101,14 @@ func produceFromList(tasks chan<- object.Object, src, dst object.ObjectStorage, 
 		go func() {
 			defer wg.Done()
 			for key := range prefixs {
-				if !strings.HasSuffix(key, "/") {
-					if err := produceSingleObject(tasks, src, dst, key, config, checkpointMgr); err == nil {
-						listedPrefix.Increment()
-						continue
-					} else if errors.Is(err, errDirSuffix) {
-						key += "/"
-					} else if os.IsNotExist(err) {
-						atomic.AddInt64(&ignoreFiles, 1)
-						listedPrefix.Increment()
-						continue
-					}
-				}
-				logger.Debugf("start listing prefix %s", key)
-				if restorePrefixFromCheckpoint(tasks, src, dst, key, config, checkpointMgr) {
+				if checkpointMgr != nil && restorePrefixFromCheckpoint(tasks, src, dst, key, config, checkpointMgr) {
 					listedPrefix.Increment()
 					continue
 				}
-				err = startProducer(tasks, src, dst, key, config.ListDepth, config, checkpointMgr)
-				if err != nil {
-					logger.Errorf("list prefix %s: %s", key, err)
-					failed.Increment()
+				if err := produceSingleObject(tasks, src, dst, key, config, checkpointMgr); err != nil {
+					if os.IsNotExist(err) {
+						atomic.AddInt64(&ignoreFiles, 1)
+					}
 				}
 				listedPrefix.Increment()
 			}
@@ -2147,7 +2134,6 @@ func produceFromList(tasks chan<- object.Object, src, dst object.ObjectStorage, 
 	return nil
 }
 
-var errDirSuffix = errors.New("dir miss suffix '/'")
 var ignoreFiles int64
 
 func produceSingleObject(tasks chan<- object.Object, src, dst object.ObjectStorage, key string, config *Config, checkpointMgr *CheckpointManager) error {
@@ -2156,14 +2142,8 @@ func produceSingleObject(tasks chan<- object.Object, src, dst object.ObjectStora
 		logger.Warnf("head %s from %s: %s", key, src, err)
 		return err
 	}
-	if obj.IsDir() && (!config.Links || !obj.IsSymlink()) {
-		// only `files-from` will hit this case
-		if !strings.HasSuffix(key, "/") {
-			return errDirSuffix
-		}
-		if !config.Dirs {
-			return nil
-		}
+	if obj.IsDir() {
+		return fmt.Errorf("skip directory: %s", key)
 	}
 	var srckeys = make(chan object.Object, 1)
 	srckeys <- obj
