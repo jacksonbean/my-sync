@@ -98,6 +98,7 @@ type GateRecordBuffer struct {
 	limit   int
 	flushCh chan struct{}
 	done    chan struct{}
+	stopped chan struct{}
 	closed  bool
 }
 
@@ -110,6 +111,7 @@ func NewGateRecordBuffer(svc sync_db.DbGateService, limit int, flushInterval tim
 		limit:   limit,
 		flushCh: make(chan struct{}, 1),
 		done:    make(chan struct{}),
+		stopped: make(chan struct{}),
 	}
 	go b.periodicFlush(flushInterval)
 	return b
@@ -118,6 +120,7 @@ func NewGateRecordBuffer(svc sync_db.DbGateService, limit int, flushInterval tim
 func (b *GateRecordBuffer) periodicFlush(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	defer close(b.stopped)
 	for {
 		select {
 		case <-ticker.C:
@@ -179,6 +182,7 @@ func (b *GateRecordBuffer) Close() error {
 	b.mu.Unlock()
 
 	close(b.done)
+	<-b.stopped // 等待 periodicFlush goroutine 退出，避免与最终 Flush 并发
 	return b.Flush()
 }
 
