@@ -54,16 +54,15 @@ type JobInfo struct {
 
 // ObjectRecord holds the sync result for a single object.
 type ObjectRecord struct {
-	JobID       string
-	SourceKey   string
-	TargetKey   string
-	Size        int64
-	ContentType string
-	Metadata    string // JSON
-	Status      ObjectStatus
-	ErrorMsg    string
-	StartTime   time.Time
-	EndTime     time.Time
+	JobID        string
+	SourceKey    string
+	TargetKey    string
+	Size         int64
+	StorageClass string // single-scan: source storage class
+	Status       ObjectStatus
+	ErrorMsg     string
+	StartTime    time.Time
+	EndTime      time.Time
 }
 
 // DbConfig holds parsed database connection info.

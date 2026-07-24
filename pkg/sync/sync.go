@@ -214,8 +214,6 @@ func maskStorageURL(s fmt.Stringer) string {
 	return u
 }
 
-var syncSrc object.ObjectStorage // source storage for Head in recordSyncObject; each worker process has its own copy
-var srcMetaCache sync.Map        // key → object.ObjectMeta, cache from copy paths
 var outputCSV *csv.Writer
 var outputCSVFile *os.File
 var doubleCheckPass int // 0 = first pass, 1 = second pass
@@ -712,13 +710,12 @@ func doCopySingle(src, dst object.ObjectStorage, key string, size int64, calChks
 	return doCopySingle0(src, dst, key, size, calChksum)
 }
 
-// getAndCacheSrcMeta retrieves metadata from source, caches it, and applies preserveMeta settings.
+// getAndCacheSrcMeta retrieves metadata from source and applies preserveMeta settings.
 func getAndCacheSrcMeta(src object.ObjectStorage, key string) object.ObjectMeta {
 	srcMeta, _ := getSrcMeta(src, key)
 	if !preserveMeta {
 		srcMeta.Metadata = nil
 	}
-	srcMetaCache.Store(key, srcMeta)
 	return srcMeta
 }
 
@@ -784,36 +781,15 @@ func recordSyncObject(jobID, key string, size int64, startTime time.Time, status
 	if syncDbService == nil {
 		return
 	}
-	contentType := ""
-	var meta map[string]string
-	// Try cache from copy paths first, fallback to Head
-	if v, ok := srcMetaCache.LoadAndDelete(key); ok {
-		m := v.(object.ObjectMeta)
-		contentType = m.ContentType
-		meta = m.Metadata
-	} else if syncSrc != nil {
-		if srcObj, err := syncSrc.Head(ctx, key); err == nil {
-			contentType = srcObj.ContentType()
-			meta = srcObj.Metadata()
-		}
-	}
-	var metaJSON string
-	if len(meta) > 0 {
-		if b, e := json.Marshal(meta); e == nil {
-			metaJSON = string(b)
-		}
-	}
 	_ = syncDbService.RecordObject(sync_db.ObjectRecord{
-		JobID:       jobID,
-		SourceKey:   key,
-		TargetKey:   key,
-		Size:        size,
-		ContentType: contentType,
-		Metadata:    metaJSON,
-		Status:      status,
-		ErrorMsg:    errMsg,
-		StartTime:   startTime,
-		EndTime:     time.Now(),
+		JobID:     jobID,
+		SourceKey: key,
+		TargetKey: key,
+		Size:      size,
+		Status:    status,
+		ErrorMsg:  errMsg,
+		StartTime: startTime,
+		EndTime:   time.Now(),
 	})
 }
 
@@ -2313,11 +2289,11 @@ func scanSingle(src object.ObjectStorage) error {
 		total++
 		if syncDbService != nil {
 			_ = syncDbService.RecordObject(sync_db.ObjectRecord{
-				JobID:       syncDbJobID,
-				SourceKey:   obj.Key(),
-				Size:        obj.Size(),
-				EndTime:     obj.Mtime(),
-				ContentType: obj.StorageClass(),
+				JobID:        syncDbJobID,
+				SourceKey:    obj.Key(),
+				Size:         obj.Size(),
+				EndTime:      obj.Mtime(),
+				StorageClass: obj.StorageClass(),
 			})
 		}
 		if outputCSV != nil {
@@ -2414,37 +2390,15 @@ func scanOnly(src, dst object.ObjectStorage) error {
 			errors++
 		}
 
-		// Record to db — prefer list result; fall back to Head only when the
-		// listing did not carry Content-Type/metadata.
-		contentType := obj.ContentType()
-		metaJSON := ""
-		if md := obj.Metadata(); len(md) > 0 {
-			if b, e := json.Marshal(md); e == nil {
-				metaJSON = string(b)
-			}
-		}
-		if contentType == "" || metaJSON == "" {
-			if srcMeta, ok := getSrcMeta(src, key); ok {
-				if contentType == "" {
-					contentType = srcMeta.ContentType
-				}
-				if metaJSON == "" && len(srcMeta.Metadata) > 0 {
-					if b, e := json.Marshal(srcMeta.Metadata); e == nil {
-						metaJSON = string(b)
-					}
-				}
-			}
-		}
+		// Record to db
 		_ = syncDbService.RecordObject(sync_db.ObjectRecord{
-			JobID:       syncDbJobID,
-			SourceKey:   key,
-			TargetKey:   key,
-			Size:        obj.Size(),
-			ContentType: contentType,
-			Metadata:    metaJSON,
-			Status:      status,
-			StartTime:   startTime,
-			EndTime:     time.Now(),
+			JobID:     syncDbJobID,
+			SourceKey: key,
+			TargetKey: key,
+			Size:      obj.Size(),
+			Status:    status,
+			StartTime: startTime,
+			EndTime:   time.Now(),
 		})
 
 		if total%1000 == 0 {
@@ -2452,7 +2406,7 @@ func scanOnly(src, dst object.ObjectStorage) error {
 				total, matches, differs, missing, errors)
 		}
 		if outputCSV != nil {
-			outputCSV.Write([]string{key, fmt.Sprintf("%d", obj.Size()), contentType, string(status)})
+			outputCSV.Write([]string{key, fmt.Sprintf("%d", obj.Size()), "", string(status)})
 		}
 	}
 
@@ -2502,7 +2456,6 @@ func scanOnly(src, dst object.ObjectStorage) error {
 // Sync syncs all the keys between to object storage
 func Sync(src, dst object.ObjectStorage, config *Config) error {
 	preserveMeta = config.PreserveMeta
-	syncSrc = src
 
 	// Init CSV output if configured
 	if config.OutputFile != "" {

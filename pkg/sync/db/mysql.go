@@ -140,8 +140,7 @@ func (s *mysqlService) createObjectsTable(tableName string) error {
 		source_key VARCHAR(2048) NOT NULL,
 		target_key VARCHAR(2048),
 		size BIGINT DEFAULT 0,
-		content_type VARCHAR(256),
-		metadata_json TEXT,
+		storage_class VARCHAR(64),
 		status VARCHAR(16) NOT NULL,
 		error_msg TEXT,
 		start_time DATETIME(3),
@@ -229,16 +228,16 @@ func (s *mysqlService) RecordObject(rec ObjectRecord) error {
 			(source_key, size, last_modified, storage_class)
 			VALUES (?, ?, ?, ?)`, s.dataDB(), table)
 		_, err := s.db.Exec(objectsSQL,
-			rec.SourceKey, rec.Size, rec.EndTime, rec.ContentType)
+			rec.SourceKey, rec.Size, rec.EndTime, rec.StorageClass)
 		return err
 	}
 
 	objectsSQL := fmt.Sprintf(`INSERT INTO `+"`%s`"+`.`+"`%s`"+`
-		(source_key, target_key, size, content_type, metadata_json, status, error_msg, start_time, end_time)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.dataDB(), table)
+		(source_key, target_key, size, storage_class, status, error_msg, start_time, end_time)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, s.dataDB(), table)
 	_, err := s.db.Exec(objectsSQL,
 		rec.SourceKey, rec.TargetKey, rec.Size,
-		rec.ContentType, rec.Metadata, string(rec.Status), rec.ErrorMsg,
+		rec.StorageClass, string(rec.Status), rec.ErrorMsg,
 		rec.StartTime, rec.EndTime)
 	return err
 }
@@ -263,27 +262,37 @@ func (s *mysqlService) RecordObjects(recs []ObjectRecord) error {
 
 func (s *mysqlService) recordObjectsSingleScan(recs []ObjectRecord, table string) error {
 	const chunkSize = 500
+	// Put all chunks in a single transaction so that a retry of the whole batch
+	// by AsyncDbService cannot insert duplicate rows.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx for single scan: %w", err)
+	}
+	if _, err := tx.Exec("SET unique_checks = 0"); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("set unique_checks: %w", err)
+	}
+	if _, err := tx.Exec("SET foreign_key_checks = 0"); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("set foreign_key_checks: %w", err)
+	}
+	committed := false
+	defer func() {
+		// Best-effort restore of session-level checks so the connection returned
+		// to the pool does not leak disabled checks to unrelated later statements.
+		_, _ = tx.Exec("SET unique_checks = 1")
+		_, _ = tx.Exec("SET foreign_key_checks = 1")
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+
 	for i := 0; i < len(recs); i += chunkSize {
 		end := i + chunkSize
 		if end > len(recs) {
 			end = len(recs)
 		}
 		batch := recs[i:end]
-
-		// Use a transaction to guarantee the session-level bulk-load optimizations
-		// apply to whichever connection the pool hands us for this batch.
-		tx, err := s.db.Begin()
-		if err != nil {
-			return fmt.Errorf("begin tx for single scan batch: %w", err)
-		}
-		if _, err := tx.Exec("SET unique_checks = 0"); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("set unique_checks: %w", err)
-		}
-		if _, err := tx.Exec("SET foreign_key_checks = 0"); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("set foreign_key_checks: %w", err)
-		}
 
 		var sb strings.Builder
 		sb.WriteString(fmt.Sprintf("INSERT INTO `%s`.`%s` (source_key, size, last_modified, storage_class) VALUES ", s.dataDB(), table))
@@ -293,31 +302,33 @@ func (s *mysqlService) recordObjectsSingleScan(recs []ObjectRecord, table string
 				sb.WriteString(",")
 			}
 			sb.WriteString("(?, ?, ?, ?)")
-			args = append(args, rec.SourceKey, rec.Size, rec.EndTime, rec.ContentType)
+			args = append(args, rec.SourceKey, rec.Size, rec.EndTime, rec.StorageClass)
 		}
 		if _, err := tx.Exec(sb.String(), args...); err != nil {
-			tx.Rollback()
 			return fmt.Errorf("batch insert single scan: %w", err)
 		}
-		// Restore session-level settings so the connection returned to the
-		// pool does not leak disabled checks to unrelated later statements.
-		if _, err := tx.Exec("SET unique_checks = 1"); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("reset unique_checks: %w", err)
-		}
-		if _, err := tx.Exec("SET foreign_key_checks = 1"); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("reset foreign_key_checks: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit single scan batch: %w", err)
-		}
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit single scan batch: %w", err)
+	}
+	committed = true
 	return nil
 }
 
 func (s *mysqlService) recordObjectsSync(recs []ObjectRecord, table string) error {
 	const chunkSize = 200
+	// Wrap all chunks in one transaction so AsyncDbService retries stay idempotent.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx for sync: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+
 	for i := 0; i < len(recs); i += chunkSize {
 		end := i + chunkSize
 		if end > len(recs) {
@@ -326,22 +337,25 @@ func (s *mysqlService) recordObjectsSync(recs []ObjectRecord, table string) erro
 		batch := recs[i:end]
 
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("INSERT INTO `%s`.`%s` (source_key, target_key, size, content_type, metadata_json, status, error_msg, start_time, end_time) VALUES ", s.dataDB(), table))
-		args := make([]interface{}, 0, len(batch)*9)
+		sb.WriteString(fmt.Sprintf("INSERT INTO `%s`.`%s` (source_key, target_key, size, storage_class, status, error_msg, start_time, end_time) VALUES ", s.dataDB(), table))
+		args := make([]interface{}, 0, len(batch)*8)
 		for j, rec := range batch {
 			if j > 0 {
 				sb.WriteString(",")
 			}
-			sb.WriteString("(?, ?, ?, ?, ?, ?, ?, ?, ?)")
+			sb.WriteString("(?, ?, ?, ?, ?, ?, ?, ?)")
 			args = append(args, rec.SourceKey, rec.TargetKey, rec.Size,
-				rec.ContentType, rec.Metadata, string(rec.Status), rec.ErrorMsg,
+				rec.StorageClass, string(rec.Status), rec.ErrorMsg,
 				rec.StartTime, rec.EndTime)
 		}
-		_, err := s.db.Exec(sb.String(), args...)
-		if err != nil {
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
 			return fmt.Errorf("batch insert sync: %w", err)
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sync batch: %w", err)
+	}
+	committed = true
 	return nil
 }
 
