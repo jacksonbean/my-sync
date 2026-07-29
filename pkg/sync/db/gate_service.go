@@ -21,6 +21,9 @@ func NewMySQLGateService(db *sql.DB, table string) (DbGateService, error) {
 	if err := svc.createTable(); err != nil {
 		return nil, fmt.Errorf("create gate table %s: %w", table, err)
 	}
+	if err := svc.checkSchema(); err != nil {
+		return nil, err
+	}
 	return svc, nil
 }
 
@@ -32,8 +35,12 @@ func (s *mysqlGateService) Close() error {
 }
 
 func (s *mysqlGateService) createTable() error {
+	// ecs-sync 风格的自增主键 + key_hash 唯一索引：
+	// 不对完整 key 建索引，兼容老版本 MySQL 767 字节的索引列上限（Error 1709）。
 	query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS `+"`%s`"+` (
-		`+"`key`"+` VARCHAR(768) PRIMARY KEY,
+		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		key_hash CHAR(32) NOT NULL,
+		`+"`key`"+` VARCHAR(768) NOT NULL,
 		source_mtime DATETIME(3) NOT NULL,
 		source_size BIGINT DEFAULT 0,
 		target_size BIGINT DEFAULT 0,
@@ -41,16 +48,74 @@ func (s *mysqlGateService) createTable() error {
 		status VARCHAR(16) NOT NULL,
 		error_msg TEXT,
 		updated_at DATETIME(3) NOT NULL,
+		UNIQUE KEY uk_key_hash (key_hash),
 		INDEX idx_gate (status, source_mtime)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, s.table)
 	_, err := s.db.Exec(query)
 	return err
 }
 
-func (s *mysqlGateService) GetRecord(key string) (*SyncRecordV2, error) {
-	query := fmt.Sprintf("SELECT `key`, source_mtime, source_size, target_size, diff, status, error_msg, updated_at\n\t\tFROM `%s` WHERE `key` = ?", s.table)
-	row := s.db.QueryRow(query, key)
+// checkSchema 检测旧 schema 的表（以 `key` 为主键、没有 key_hash 列）。
+// 不做自动迁移，提示手动 DROP 后由调用方回退到 no gate。
+func (s *mysqlGateService) checkSchema() error {
+	var col string
+	err := s.db.QueryRow(`SELECT COLUMN_NAME FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'key_hash'`, s.table).Scan(&col)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("gate table %s uses the old schema (primary key on `key`), please DROP TABLE `%s` and re-run", s.table, s.table)
+	}
+	return err
+}
 
+func (s *mysqlGateService) GetRecord(key string) (*SyncRecordV2, error) {
+	query := fmt.Sprintf("SELECT `key`, source_mtime, source_size, target_size, diff, status, error_msg, updated_at\n\t\tFROM `%s` WHERE key_hash = ?", s.table)
+	row := s.db.QueryRow(query, KeyHash(key))
+	return scanGateRecord(row)
+}
+
+func (s *mysqlGateService) GetRecords(keys []string) (map[string]*SyncRecordV2, error) {
+	result := make(map[string]*SyncRecordV2, len(keys))
+	const chunkSize = 500
+	for i := 0; i < len(keys); i += chunkSize {
+		end := i + chunkSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		chunk := keys[i:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]interface{}, len(chunk))
+		for j, k := range chunk {
+			placeholders[j] = "?"
+			args[j] = KeyHash(k)
+		}
+		query := fmt.Sprintf("SELECT `key`, source_mtime, source_size, target_size, diff, status, error_msg, updated_at\n\t\tFROM `%s` WHERE key_hash IN (%s)", s.table, strings.Join(placeholders, ","))
+		rows, err := s.db.Query(query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			rec, err := scanGateRecord(rows)
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+			result[rec.Key] = rec
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return result, nil
+}
+
+// rowScanner 抽象 *sql.Row 与 *sql.Rows 的 Scan，统一单查/批查的扫描逻辑。
+type rowScanner interface {
+	Scan(dest ...interface{}) error
+}
+
+func scanGateRecord(row rowScanner) (*SyncRecordV2, error) {
 	var rec SyncRecordV2
 	var diffInt int
 	var errorMsg sql.NullString
@@ -85,8 +150,8 @@ func (s *mysqlGateService) BatchSaveRecords(recs []*SyncRecordV2) error {
 }
 
 func (s *mysqlGateService) upsertOne(rec *SyncRecordV2) error {
-	query := fmt.Sprintf("INSERT INTO `%s` (`key`, source_mtime, source_size, target_size, diff, status, error_msg, updated_at)\n\t\tVALUES (?, ?, ?, ?, ?, ?, ?, ?)\n\t\tON DUPLICATE KEY UPDATE\n\t\t\tsource_mtime = VALUES(source_mtime),\n\t\t\tsource_size = VALUES(source_size),\n\t\t\ttarget_size = VALUES(target_size),\n\t\t\tdiff = VALUES(diff),\n\t\t\tstatus = VALUES(status),\n\t\t\terror_msg = VALUES(error_msg),\n\t\t\tupdated_at = VALUES(updated_at)", s.table)
-	_, err := s.db.Exec(query, rec.Key, rec.SourceMtime, rec.SourceSize, rec.TargetSize, boolToInt(rec.Diff), rec.Status, rec.ErrorMsg, rec.UpdatedAt)
+	query := fmt.Sprintf("INSERT INTO `%s` (key_hash, `key`, source_mtime, source_size, target_size, diff, status, error_msg, updated_at)\n\t\tVALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)\n\t\tON DUPLICATE KEY UPDATE\n\t\t\tsource_mtime = VALUES(source_mtime),\n\t\t\tsource_size = VALUES(source_size),\n\t\t\ttarget_size = VALUES(target_size),\n\t\t\tdiff = VALUES(diff),\n\t\t\tstatus = VALUES(status),\n\t\t\terror_msg = VALUES(error_msg),\n\t\t\tupdated_at = VALUES(updated_at)", s.table)
+	_, err := s.db.Exec(query, KeyHash(rec.Key), rec.Key, rec.SourceMtime, rec.SourceSize, rec.TargetSize, boolToInt(rec.Diff), rec.Status, rec.ErrorMsg, rec.UpdatedAt)
 	return err
 }
 
@@ -107,14 +172,14 @@ func (s *mysqlGateService) upsertBatch(recs []*SyncRecordV2) error {
 
 func (s *mysqlGateService) upsertChunk(recs []*SyncRecordV2) error {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("INSERT INTO `%s` (`key`, source_mtime, source_size, target_size, diff, status, error_msg, updated_at) VALUES ", s.table))
-	args := make([]interface{}, 0, len(recs)*8)
+	sb.WriteString(fmt.Sprintf("INSERT INTO `%s` (key_hash, `key`, source_mtime, source_size, target_size, diff, status, error_msg, updated_at) VALUES ", s.table))
+	args := make([]interface{}, 0, len(recs)*9)
 	for j, rec := range recs {
 		if j > 0 {
 			sb.WriteString(",")
 		}
-		sb.WriteString("(?, ?, ?, ?, ?, ?, ?, ?)")
-		args = append(args, rec.Key, rec.SourceMtime, rec.SourceSize, rec.TargetSize, boolToInt(rec.Diff), rec.Status, rec.ErrorMsg, rec.UpdatedAt)
+		sb.WriteString("(?, ?, ?, ?, ?, ?, ?, ?, ?)")
+		args = append(args, KeyHash(rec.Key), rec.Key, rec.SourceMtime, rec.SourceSize, rec.TargetSize, boolToInt(rec.Diff), rec.Status, rec.ErrorMsg, rec.UpdatedAt)
 	}
 	sb.WriteString(` ON DUPLICATE KEY UPDATE
 		source_mtime = VALUES(source_mtime),
@@ -147,13 +212,14 @@ func NewGateService(dsn string, table string) (DbGateService, error) {
 	if cfg.Driver != "mysql" {
 		return nil, fmt.Errorf("unsupported gate db driver: %s", cfg.Driver)
 	}
-	dbDSN := fmt.Sprintf("%s:%s@tcp(%s)/%s?charset=utf8mb4&parseTime=True&loc=Local", cfg.User, cfg.Pass, cfg.Host, cfg.DBName)
+	dbDSN := fmt.Sprintf("%s:%s@tcp(%s)/%s?charset=utf8mb4&parseTime=True&loc=Local&interpolateParams=true", cfg.User, cfg.Pass, cfg.Host, cfg.DBName)
 	db, err := sql.Open("mysql", dbDSN)
 	if err != nil {
 		return nil, fmt.Errorf("open gate db: %w", err)
 	}
-	db.SetMaxOpenConns(5)
-	db.SetMaxIdleConns(2)
+	// 对齐 ecs-sync 的连接池配置（Hikari maximumPoolSize=16）。
+	db.SetMaxOpenConns(16)
+	db.SetMaxIdleConns(4)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	if err := db.Ping(); err != nil {
 		db.Close()
@@ -209,22 +275,44 @@ func (s *sqliteGateService) createTable() error {
 func (s *sqliteGateService) GetRecord(key string) (*SyncRecordV2, error) {
 	query := fmt.Sprintf("SELECT \"key\", source_mtime, source_size, target_size, diff, status, error_msg, updated_at\n\t\tFROM %s WHERE \"key\" = ?", s.table)
 	row := s.db.QueryRow(query, key)
+	return scanGateRecord(row)
+}
 
-	var rec SyncRecordV2
-	var diffInt int
-	var errorMsg sql.NullString
-	err := row.Scan(&rec.Key, &rec.SourceMtime, &rec.SourceSize, &rec.TargetSize, &diffInt, &rec.Status, &errorMsg, &rec.UpdatedAt)
-	if err == sql.ErrNoRows {
-		return nil, nil
+func (s *sqliteGateService) GetRecords(keys []string) (map[string]*SyncRecordV2, error) {
+	result := make(map[string]*SyncRecordV2, len(keys))
+	const chunkSize = 500
+	for i := 0; i < len(keys); i += chunkSize {
+		end := i + chunkSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		chunk := keys[i:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]interface{}, len(chunk))
+		for j, k := range chunk {
+			placeholders[j] = "?"
+			args[j] = k
+		}
+		query := fmt.Sprintf("SELECT \"key\", source_mtime, source_size, target_size, diff, status, error_msg, updated_at\n\t\tFROM %s WHERE \"key\" IN (%s)", s.table, strings.Join(placeholders, ","))
+		rows, err := s.db.Query(query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			rec, err := scanGateRecord(rows)
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+			result[rec.Key] = rec
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
-	if err != nil {
-		return nil, err
-	}
-	rec.Diff = diffInt != 0
-	if errorMsg.Valid {
-		rec.ErrorMsg = errorMsg.String
-	}
-	return &rec, nil
+	return result, nil
 }
 
 func (s *sqliteGateService) SaveRecord(rec *SyncRecordV2) error {

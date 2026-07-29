@@ -1554,6 +1554,22 @@ func startSingleProducer(tasks chan<- object.Object, src, dst object.ObjectStora
 func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, config *Config, checkpointMgr *CheckpointManager, prefix string) (retErr error) {
 	srckeys = filter(srckeys, config.rules, config)
 	dstkeys = filter(dstkeys, config.rules, config)
+
+	// 第一层门卫是否启用：
+	// - --force-update 时门卫无意义（强制覆盖）；
+	// - --ignore-existing 的 skip 决策完全由 dst listing 决定，门卫的 DB 状态不影响决策，
+	//   逐对象查询纯属浪费，直接跳过。
+	useFirstGate := gateSvc != nil && !config.ForceUpdate && !config.IgnoreExisting
+	produceDone := make(chan struct{})
+	defer close(produceDone)
+	var srcCh <-chan gatedObject
+	if useFirstGate {
+		// 批量预取 gate 记录，避免单 goroutine 逐对象 SELECT（N+1 查询）拖慢 produce
+		srcCh = prefetchGateRecords(gateSvc, srckeys, produceDone)
+	} else {
+		srcCh = passThroughObjects(srckeys, produceDone)
+	}
+
 	var dstobj object.Object
 	var (
 		skip, skipBytes int64
@@ -1595,7 +1611,8 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 		tasks <- obj
 	}
 
-	for obj := range srckeys {
+	for gobj := range srcCh {
+		obj := gobj.obj
 		if obj == nil {
 			return fmt.Errorf("listing failed, stop syncing, waiting for pending ones")
 		}
@@ -1649,21 +1666,17 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 		// ========== 【第一层：DB 快速门卫】==========
 		// 必须先完成 src/dst key 对齐和 extra 处理，再做 GateSkip；否则
 		// --delete-dst 会把“源被 gate 跳过、但目标实际存在”的对象误删。
-		if gateSvc != nil && !config.ForceUpdate {
-			record, err := gateSvc.GetRecord(obj.Key())
-			if err != nil {
-				logger.Warnf("firstGate: failed to query db for %s: %s", obj.Key(), err)
-			} else {
-				result := firstGate(obj, record, config.ForceUpdate)
-				if result == sync_db.GateSkip {
-					if dstobj != nil && obj.Key() == dstobj.Key() {
-						dstobj = nil
-					}
-					skipIt(obj)
-					continue
+		// gate 记录由预取 goroutine 批量查询（gobj.rec），此处零 DB 调用。
+		if useFirstGate {
+			result := firstGate(obj, gobj.rec, config.ForceUpdate)
+			if result == sync_db.GateSkip {
+				if dstobj != nil && obj.Key() == dstobj.Key() {
+					dstobj = nil
 				}
-				// GateMissing / GateNeedSecondGate → 继续走第二层
+				skipIt(obj)
+				continue
 			}
+			// GateMissing / GateNeedSecondGate → 继续走第二层
 		}
 		// ============================================
 

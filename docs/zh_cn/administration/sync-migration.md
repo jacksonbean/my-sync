@@ -114,7 +114,10 @@ flowchart TD
 - scan-single job：`single_scan_jobs.sync_jobs`；明细：`single_scan.scan_<job_id>`。
 - gate：`NewGateService` 使用 `--db` DSN path 指定的数据库，表为 `--gate-table` 或 `sync_records_v2_<hash>`。因此 DSN 需要带 database，例如 `mysql://user:pass@host:3306/juicefs_gate`。
 
-gate 表关键字段：`key`、`source_mtime`、`source_size`、`target_size`、`diff`、`status(success/failed/skipped)`、`error_msg`、`updated_at`。
+gate 表关键字段：`id`（自增主键）、`key_hash`（key 的 MD5，唯一索引，用于查询与去重）、`key`、`source_mtime`、`source_size`、`target_size`、`diff`、`status(success/failed/skipped)`、`error_msg`、`updated_at`。
+
+> 注意：自增主键 + `key_hash` 唯一索引的表结构兼容老版本 MySQL（767 字节索引上限）。
+> 如果 gate 表是早期版本创建的（以 `key` 为主键），需要手动 `DROP TABLE` 后重新运行，程序检测到旧结构时会提示并回退 no gate。
 
 ## 6. checkpoint、信号与失败控制
 

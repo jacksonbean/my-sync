@@ -213,3 +213,57 @@ juicefs sync --db mysql://u:p@host/db --force-update s3://src/ s3://dst/
 2. **Gate 表清理命令**：提供 `--gate-reset` 或 `--gate-truncate` 参数，方便运维重置 gate 记录。
 3. **Gate 记录过期**：添加 TTL 机制（如 `updated_at < NOW() - INTERVAL 90 DAY` 的记录自动删除），防止 DB 无限膨胀。
 4. **多 worker 并发写优化**：当前每个 worker 独立连接 DB 写入 gate 记录。如果 worker 数量很大，可能产生写冲突。可考虑 worker 只发送 gate 记录给 manager，由 manager 统一批量写入。
+
+---
+
+## 2026-07-29 更新：老版本 MySQL 兼容 + --db 性能修复
+
+### 表结构变更（ecs-sync 风格自增主键）
+
+原 schema 以 `key VARCHAR(768) PRIMARY KEY`（utf8mb4，索引需 3072 字节），在老版本 MySQL
+（InnoDB 行格式 REDUNDANT/COMPACT，如 MySQL ≤5.6 / MariaDB ≤10.1）上触发
+`Error 1709: Index column size too large. The maximum column size is 767 bytes`，建表失败。
+
+新 schema 改为自增主键 + `key_hash CHAR(32)` 唯一索引（key 的 MD5 hex，Go 侧计算）：
+
+```sql
+CREATE TABLE IF NOT EXISTS sync_records_v2_xxx (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    key_hash CHAR(32) NOT NULL,
+    `key` VARCHAR(768) NOT NULL,            -- 仅诊断用，不上索引
+    source_mtime DATETIME(3) NOT NULL,
+    source_size BIGINT DEFAULT 0,
+    target_size BIGINT DEFAULT 0,
+    diff BOOLEAN DEFAULT FALSE,
+    status VARCHAR(16) NOT NULL,
+    error_msg TEXT,
+    updated_at DATETIME(3) NOT NULL,
+    UNIQUE KEY uk_key_hash (key_hash),      -- 32 字节，任何版本都能建
+    INDEX idx_gate (status, source_mtime)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+- 查询与去重都走 `key_hash`（`WHERE key_hash = ?` / `ON DUPLICATE KEY UPDATE`）。
+- **不做旧表自动迁移**：检测到旧 schema 表时记 warning 提示手动 `DROP TABLE`，回退 no gate。
+
+### 第一层门卫批量预取（消除 N+1 查询）
+
+原实现：produce 单 goroutine 逐对象 `SELECT`（任意时刻仅 1 个查询在飞），
+吞吐被钉死在 1/RTT（50ms 延迟 → ~20 条/秒 ≈ 1200 条/分钟）。
+
+新实现：`prefetchGateRecords` goroutine 按批（500 个 / 50ms 无新对象 / 流结束）收集对象，
+每批一次 `GetRecords`（`WHERE key_hash IN (...)`），produce 主循环消费 `(obj, record)`。
+500 次串行查询合并为 1 次，且 DB 查询与 listing 并行。批查询失败时该批 record 为 nil，
+落第二门卫（与原单查失败行为一致）。
+
+### --ignore-existing 场景跳过第一层
+
+`--ignore-existing` 的 skip 决策完全由 dst listing 决定，门卫 DB 状态不影响决策，
+因此该场景下第一层门卫（含预取）整体跳过，produce 零 DB 查询。
+
+### 异步记录写入提速
+
+- `AsyncDbService` 批次 500 → 2000，`recordObjectsSync` chunk 200 → 500；
+- 两个 MySQL DSN 增加 `interpolateParams=true`（等效 ecs-sync 的 cachePrepStmts）；
+- gate 连接池 `SetMaxOpenConns` 5 → 16（对齐 ecs-sync Hikari maximumPoolSize=16）；
+- `flushBatch` 增加每批落盘耗时的 debug 日志。

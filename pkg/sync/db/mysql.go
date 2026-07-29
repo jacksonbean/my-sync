@@ -33,7 +33,7 @@ type mysqlService struct {
 
 // NewMySQLService creates a new MySQL-backed DbService.
 func NewMySQLService(cfg *DbConfig, isScan, isSingleScan bool) (DbService, error) {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s)/?charset=utf8mb4&parseTime=True&loc=Local", cfg.User, cfg.Pass, cfg.Host)
+	dsn := fmt.Sprintf("%s:%s@tcp(%s)/?charset=utf8mb4&parseTime=True&loc=Local&interpolateParams=true", cfg.User, cfg.Pass, cfg.Host)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err
@@ -316,7 +316,7 @@ func (s *mysqlService) recordObjectsSingleScan(recs []ObjectRecord, table string
 }
 
 func (s *mysqlService) recordObjectsSync(recs []ObjectRecord, table string) error {
-	const chunkSize = 200
+	const chunkSize = 500
 	// Wrap all chunks in one transaction so AsyncDbService retries stay idempotent.
 	tx, err := s.db.Begin()
 	if err != nil {

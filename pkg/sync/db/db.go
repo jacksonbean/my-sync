@@ -159,7 +159,7 @@ const channelSize = 50000
 
 // batchSize is the number of records to accumulate before flushing to DB.
 // For scan-single (millions of objects), a larger batch reduces round trips.
-const batchSize = 500
+const batchSize = 2000
 
 // flushInterval is the max time between batch flushes.
 const flushInterval = time.Second
@@ -220,6 +220,8 @@ func (a *AsyncDbService) flushBatch() {
 	if len(a.batch) == 0 {
 		return
 	}
+	n := len(a.batch)
+	start := time.Now()
 	if err := a.DbService.RecordObjects(a.batch); err != nil {
 		a.mu.Lock()
 		a.errors = append(a.errors, err)
@@ -227,16 +229,18 @@ func (a *AsyncDbService) flushBatch() {
 		retries := a.flushRetries
 		a.mu.Unlock()
 		if retries >= 3 {
-			logger.Warnf("Dropping %d records after %d failed attempts: %s", len(a.batch), retries, err)
+			logger.Warnf("Dropping %d records after %d failed attempts: %s", n, retries, err)
 			a.batch = a.batch[:0]
 			a.mu.Lock()
 			a.flushRetries = 0
 			a.mu.Unlock()
 		} else {
-			logger.Errorf("Failed to batch record %d objects: %s, will retry on next flush", len(a.batch), err)
+			logger.Errorf("Failed to batch record %d objects: %s, will retry on next flush", n, err)
 		}
 		return
 	}
+	// 记录每批落盘耗时，便于现场确认 DB 写入是否成为瓶颈。
+	logger.Debugf("Flushed %d object records to DB in %s", n, time.Since(start))
 	a.mu.Lock()
 	a.flushRetries = 0
 	a.mu.Unlock()

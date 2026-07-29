@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/object"
 	sync_db "github.com/juicedata/juicefs/pkg/sync/db"
 )
 
@@ -19,19 +20,19 @@ type mockObject struct {
 	isDir bool
 }
 
-func (m *mockObject) Key() string     { return m.key }
-func (m *mockObject) Size() int64     { return m.size }
-func (m *mockObject) Mtime() time.Time { return m.mtime }
-func (m *mockObject) IsDir() bool     { return m.isDir }
-func (m *mockObject) IsSymlink() bool { return false }
-func (m *mockObject) String() string  { return m.key }
-func (m *mockObject) ContentType() string { return "" }
+func (m *mockObject) Key() string                 { return m.key }
+func (m *mockObject) Size() int64                 { return m.size }
+func (m *mockObject) Mtime() time.Time            { return m.mtime }
+func (m *mockObject) IsDir() bool                 { return m.isDir }
+func (m *mockObject) IsSymlink() bool             { return false }
+func (m *mockObject) String() string              { return m.key }
+func (m *mockObject) ContentType() string         { return "" }
 func (m *mockObject) Metadata() map[string]string { return nil }
-func (m *mockObject) StorageClass() string { return "" }
-func (m *mockObject) Status() string { return "" }
-func (m *mockObject) Owner() string { return "" }
-func (m *mockObject) Group() string { return "" }
-func (m *mockObject) Mode() int { return 0 }
+func (m *mockObject) StorageClass() string        { return "" }
+func (m *mockObject) Status() string              { return "" }
+func (m *mockObject) Owner() string               { return "" }
+func (m *mockObject) Group() string               { return "" }
+func (m *mockObject) Mode() int                   { return 0 }
 
 // 确保 mockObject 实现足够接口
 var _ interface {
@@ -174,15 +175,29 @@ func recordSkipToRec(obj *mockObject, targetSize int64) *sync_db.SyncRecordV2 {
 // -------------------- GateRecordBuffer 测试（Mock） --------------------
 
 type mockDbGateService struct {
-	mu      sync.Mutex
-	records map[string]*sync_db.SyncRecordV2
-	batches [][]*sync_db.SyncRecordV2
+	mu         sync.Mutex
+	records    map[string]*sync_db.SyncRecordV2
+	batches    [][]*sync_db.SyncRecordV2
+	queryCount int // GetRecords 调用次数（验证批量预取合并了查询）
 }
 
 func (m *mockDbGateService) GetRecord(key string) (*sync_db.SyncRecordV2, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.records[key], nil
+}
+
+func (m *mockDbGateService) GetRecords(keys []string) (map[string]*sync_db.SyncRecordV2, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make(map[string]*sync_db.SyncRecordV2, len(keys))
+	for _, k := range keys {
+		if rec, ok := m.records[k]; ok {
+			result[k] = rec
+		}
+	}
+	m.queryCount++
+	return result, nil
 }
 
 func (m *mockDbGateService) SaveRecord(rec *sync_db.SyncRecordV2) error {
@@ -314,6 +329,9 @@ type mockFailingDbGateService struct {
 func (m *mockFailingDbGateService) GetRecord(key string) (*sync_db.SyncRecordV2, error) {
 	return nil, nil
 }
+func (m *mockFailingDbGateService) GetRecords(keys []string) (map[string]*sync_db.SyncRecordV2, error) {
+	return nil, errors.New("query error")
+}
 func (m *mockFailingDbGateService) SaveRecord(rec *sync_db.SyncRecordV2) error {
 	return errors.New("save error")
 }
@@ -356,5 +374,129 @@ func TestGateRecordBufferConcurrent(t *testing.T) {
 	}
 	if mock.recordCount() != 1000 {
 		t.Errorf("expected 1000 unique records, got %d", mock.recordCount())
+	}
+}
+
+// -------------------- 批量预取测试 --------------------
+
+func TestPrefetchGateRecordsBatches(t *testing.T) {
+	mock := &mockDbGateService{
+		records: make(map[string]*sync_db.SyncRecordV2),
+	}
+	now := time.Now()
+	// 预置部分记录（奇数 key 已同步成功）
+	for i := 0; i < 1200; i += 2 {
+		key := fmt.Sprintf("key_%d", i)
+		mock.records[key] = &sync_db.SyncRecordV2{Key: key, Status: "success", SourceMtime: now}
+	}
+
+	in := make(chan object.Object, 1200)
+	for i := 0; i < 1200; i++ {
+		in <- &mockObject{key: fmt.Sprintf("key_%d", i), mtime: now}
+	}
+	close(in)
+
+	done := make(chan struct{})
+	defer close(done)
+	out := prefetchGateRecords(mock, in, done)
+
+	count := 0
+	for gobj := range out {
+		if gobj.obj == nil {
+			t.Fatalf("unexpected nil object at %d", count)
+		}
+		// 奇数 key 无记录，偶数 key 有记录
+		wantRec := count%2 == 0
+		if (gobj.rec != nil) != wantRec {
+			t.Errorf("obj %s: record presence = %v, want %v", gobj.obj.Key(), gobj.rec != nil, wantRec)
+		}
+		count++
+	}
+	if count != 1200 {
+		t.Errorf("expected 1200 objects, got %d", count)
+	}
+	// 1200 个对象应合并为 3 次查询（500+500+200），而不是 1200 次
+	if mock.queryCount != 3 {
+		t.Errorf("expected 3 batch queries, got %d", mock.queryCount)
+	}
+}
+
+func TestPrefetchGateRecordsQueryError(t *testing.T) {
+	failingMock := &mockFailingDbGateService{}
+	in := make(chan object.Object, 3)
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		in <- &mockObject{key: fmt.Sprintf("key_%d", i), mtime: now}
+	}
+	close(in)
+
+	done := make(chan struct{})
+	defer close(done)
+	out := prefetchGateRecords(failingMock, in, done)
+
+	count := 0
+	for gobj := range out {
+		if gobj.obj == nil {
+			t.Fatalf("unexpected nil object")
+		}
+		// 查询失败时 record 为 nil（落第二门卫），对象不能丢
+		if gobj.rec != nil {
+			t.Errorf("expected nil record on query error, got %+v", gobj.rec)
+		}
+		count++
+	}
+	if count != 3 {
+		t.Errorf("expected 3 objects despite query error, got %d", count)
+	}
+}
+
+func TestPrefetchGateRecordsNilPassthrough(t *testing.T) {
+	mock := &mockDbGateService{
+		records: make(map[string]*sync_db.SyncRecordV2),
+	}
+	in := make(chan object.Object, 3)
+	now := time.Now()
+	in <- &mockObject{key: "key_0", mtime: now}
+	in <- nil // listing 失败信号
+	close(in)
+
+	done := make(chan struct{})
+	defer close(done)
+	out := prefetchGateRecords(mock, in, done)
+
+	var results []gatedObject
+	for gobj := range out {
+		results = append(results, gobj)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	if results[0].obj == nil || results[0].obj.Key() != "key_0" {
+		t.Errorf("first result should be key_0, got %+v", results[0].obj)
+	}
+	if results[1].obj != nil {
+		t.Errorf("nil listing-failure signal should be passed through, got %+v", results[1].obj)
+	}
+}
+
+func TestPrefetchGateRecordsDoneExits(t *testing.T) {
+	mock := &mockDbGateService{
+		records: make(map[string]*sync_db.SyncRecordV2),
+	}
+	in := make(chan object.Object) // 无缓冲，模拟持续 listing
+	done := make(chan struct{})
+	out := prefetchGateRecords(mock, in, done)
+
+	// 不消费 out、不再生产，直接关闭 done（模拟 produce 提前返回）
+	close(done)
+	select {
+	case _, ok := <-out:
+		if ok {
+			// 允许读出已缓冲的数据，继续等到关闭
+			for range out {
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("prefetch goroutine did not exit after done closed")
 	}
 }

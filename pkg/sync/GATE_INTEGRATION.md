@@ -96,10 +96,10 @@ for obj := range srckeys {
         // 消费 dstkeys，直到 obj.Key() <= dstobj.Key()
     }
 
-    // 2) 第一层：DB 快速门卫
-    if gateSvc != nil && !config.ForceUpdate {
-        record, err := gateSvc.GetRecord(obj.Key())
-        if err == nil && firstGate(obj, record, config.ForceUpdate) == sync_db.GateSkip {
+    // 2) 第一层：DB 快速门卫（gate 记录由预取 goroutine 批量查询，此处零 DB 调用）
+    //    --force-update / --ignore-existing 时不启用第一层（后者 skip 决策完全由 dst listing 决定）
+    if useFirstGate {
+        if firstGate(obj, gobj.rec, config.ForceUpdate) == sync_db.GateSkip {
             if dstobj != nil && obj.Key() == dstobj.Key() {
                 dstobj = nil // 关键：消费同 key 的 dst 游标，避免误判 extra
             }

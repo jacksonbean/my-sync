@@ -87,6 +87,112 @@ func secondGate(obj object.Object, dstObj object.Object, forceUpdate bool) Secon
 	return ActionSend
 }
 
+// -------------------- 第一层门卫批量预取 --------------------
+
+// gatedObject 是预取阶段的输出：对象 + 其 gate 记录（不存在或查询失败时为 nil）。
+type gatedObject struct {
+	obj object.Object
+	rec *sync_db.SyncRecordV2
+}
+
+// prefetchGateRecords 从 in 按批收集对象，每批一次 GetRecords（IN 查询），
+// 把 (obj, record) 送入返回的 channel。相比逐对象 SELECT（N+1 查询，吞吐被钉死在
+// 1/RTT），批量预取把 500 次串行查询合并为 1 次，且 DB 查询与 listing 并行。
+//
+// 出批条件：满 batchSize 个 / flushAfter 内无新对象 / in 关闭（强制出批）。
+// 查询失败时记 warning，该批 record 传 nil（落第二门卫，与单查失败行为一致）。
+// done 关闭时 goroutine 退出（produce 提前返回时不泄漏）。
+func prefetchGateRecords(svc sync_db.DbGateService, in <-chan object.Object, done <-chan struct{}) <-chan gatedObject {
+	const batchSize = 500
+	const flushAfter = 50 * time.Millisecond
+	out := make(chan gatedObject, batchSize)
+	go func() {
+		defer close(out)
+		var objs []object.Object
+		// flush 把当前批查询并推送结果；返回 false 表示 done 关闭应退出。
+		flush := func() bool {
+			if len(objs) == 0 {
+				return true
+			}
+			keys := make([]string, len(objs))
+			for i, o := range objs {
+				keys[i] = o.Key()
+			}
+			recs, err := svc.GetRecords(keys)
+			if err != nil {
+				logger.Warnf("gate prefetch: batch query failed (%d keys), fall back to second gate: %s", len(keys), err)
+				recs = nil
+			}
+			for _, o := range objs {
+				select {
+				case out <- gatedObject{obj: o, rec: recs[o.Key()]}:
+				case <-done:
+					return false
+				}
+			}
+			objs = objs[:0]
+			return true
+		}
+	batchLoop:
+		for {
+			// 收集一批：满 batchSize 或 flushAfter 超时或流结束
+			timer := time.NewTimer(flushAfter)
+			for len(objs) < batchSize {
+				select {
+				case obj, ok := <-in:
+					if !ok { // 流结束：强制出批后退出
+						timer.Stop()
+						flush()
+						return
+					}
+					if obj == nil { // listing 失败信号：先出批，再原样转发
+						timer.Stop()
+						if !flush() {
+							return
+						}
+						select {
+						case out <- gatedObject{obj: nil}:
+						case <-done:
+						}
+						return
+					}
+					objs = append(objs, obj)
+				case <-timer.C:
+					if !flush() {
+						return
+					}
+					continue batchLoop
+				case <-done:
+					timer.Stop()
+					return
+				}
+			}
+			timer.Stop()
+			if !flush() {
+				return
+			}
+		}
+	}()
+	return out
+}
+
+// passThroughObjects 直接把 object channel 包装成 gatedObject channel（rec 恒为 nil），
+// 用于门卫查询被禁用的场景，使 produce 主循环只需处理一种类型。
+func passThroughObjects(in <-chan object.Object, done <-chan struct{}) <-chan gatedObject {
+	out := make(chan gatedObject, 1000)
+	go func() {
+		defer close(out)
+		for obj := range in {
+			select {
+			case out <- gatedObject{obj: obj}:
+			case <-done:
+				return
+			}
+		}
+	}()
+	return out
+}
+
 // -------------------- 批量 DB 写入缓冲 --------------------
 
 // GateRecordBuffer 在 sync 过程中缓冲成功记录，批量写入 DB，避免逐条写拖慢同步。
