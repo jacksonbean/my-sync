@@ -323,7 +323,7 @@ listAll(src) ──► for obj := range srckeys
                     │
                     ▼
             ┌───────────────┐
-            │ 第一层门卫    │  ← 查 DB (GetRecord)
+            │ 第一层门卫    │  ← 批量预取 DB（GetRecords，500 个/次 IN 查询）
             │ firstGate()   │
             └───────┬───────┘
                     │

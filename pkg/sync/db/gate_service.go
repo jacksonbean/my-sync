@@ -225,7 +225,13 @@ func NewGateService(dsn string, table string) (DbGateService, error) {
 		db.Close()
 		return nil, fmt.Errorf("ping gate db: %w", err)
 	}
-	return NewMySQLGateService(db, table)
+	svc, err := NewMySQLGateService(db, table)
+	if err != nil {
+		// 建表/旧 schema 检测失败时关闭连接池，避免泄漏（调用方会回退 no gate）。
+		db.Close()
+		return nil, err
+	}
+	return svc, nil
 }
 
 // sqliteGateService 使用 SQLite 实现 DbGateService。
