@@ -992,7 +992,6 @@ juicefs sync --include='a1/b1' --exclude='a*' --include='b2' --exclude='b?' s3:/
 |`--output`|将 scan/scan-single 结果输出到 CSV。|
 |`--double-check`|正常同步结束后再执行一遍查漏。|
 |`--fix-meta`|仅修复同 size 对象的 Content-Type/metadata，不复制数据；在正常同步流程前返回。|
-|`--retry-failed`|需配合 `--db`/gate：重试失败/跳过记录，成功且源 mtime 未变的对象由第一层 gate 跳过。|
 |`--gate-table`|指定两层 gate 记录表；默认根据 src/dst 哈希生成 `sync_records_v2_<hash>`。|
 
 #### 对象存储相关参数 {#sync-storage-related-options}

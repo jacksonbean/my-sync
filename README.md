@@ -197,7 +197,6 @@ chunkedEncrypted.PutWithMeta()  ← MetadataPutter 接口
 | `--perms` | false | 保留文件权限 |
 | `--dirs` | false | 包含目录条目 |
 | `--fix-meta` | false | 修复 Content-Type/metadata；在正常同步流程前返回，不复制数据 |
-| `--retry-failed` | false | 需配合 `--db`/gate：重试失败/跳过记录，成功且源未变对象由第一层 gate 跳过 |
 | `--double-check` | false | 同步后二次扫描 |
 
 ## 存储 URI 格式

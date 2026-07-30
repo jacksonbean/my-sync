@@ -218,10 +218,6 @@ func syncActionFlags() []cli.Flag {
 			Name:  "fix-meta",
 			Usage: "fix Content-Type and metadata on destination without re-copying data (same-size objects only)",
 		},
-		&cli.BoolFlag{
-			Name:  "retry-failed",
-			Usage: "with --db/gate, re-attempt previously failed objects while unchanged successful objects are skipped by the gate",
-		},
 		&cli.StringFlag{
 			Name:  "gate-table",
 			Usage: "custom table name for two-layer gate sync records (default: auto-generated from src and dst hash). Use this to share gate records across sync runs or multiple workers.",

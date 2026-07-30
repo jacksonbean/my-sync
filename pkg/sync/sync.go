@@ -3016,15 +3016,6 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		}()
 		delWg.Wait()
 	}
-	// Retry failed: with --db/gate enabled, previously failed objects are sent to
-	// the second gate again while successful unchanged objects are skipped by the first gate.
-	if config.RetryFailed {
-		if syncDbService == nil {
-			return fmt.Errorf("--retry-failed requires --db")
-		}
-		logger.Infof("Retry-failed mode: failed gate records will be re-attempted during normal sync")
-	}
-
 	// Double check: second pass to catch objects added during first pass
 	if config.DoubleCheck && doubleCheckPass == 0 {
 		doubleCheckPass = 1

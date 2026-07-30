@@ -168,6 +168,7 @@ const flushInterval = time.Second
 type AsyncDbService struct {
 	DbService
 	ch           chan ObjectRecord
+	done         chan struct{}
 	wg           sync.WaitGroup
 	closed       bool
 	mu           sync.Mutex
@@ -181,6 +182,7 @@ func NewAsyncDbService(svc DbService) *AsyncDbService {
 	a := &AsyncDbService{
 		DbService: svc,
 		ch:        make(chan ObjectRecord, channelSize),
+		done:      make(chan struct{}),
 		batch:     make([]ObjectRecord, 0, batchSize),
 	}
 	a.wg.Add(1)
@@ -194,16 +196,7 @@ func (a *AsyncDbService) worker() {
 	defer ticker.Stop()
 	for {
 		select {
-		case rec, ok := <-a.ch:
-			if !ok {
-				// Final flush: no more records will arrive, so retry the remaining
-				// batch immediately instead of waiting for a future tick that will
-				// never come. flushBatch drops the batch after 3 failed attempts.
-				for len(a.batch) > 0 {
-					a.flushBatch()
-				}
-				return
-			}
+		case rec := <-a.ch:
 			a.batch = append(a.batch, rec)
 			if len(a.batch) >= batchSize {
 				a.flushBatch()
@@ -211,6 +204,26 @@ func (a *AsyncDbService) worker() {
 		case <-ticker.C:
 			if len(a.batch) > 0 {
 				a.flushBatch()
+			}
+		case <-a.done:
+			// 尽力排空 channel 中剩余记录后做最终刷盘。
+			// 注意：ch 永不关闭（见 Close），此处用非阻塞读排空。
+			for {
+				select {
+				case rec := <-a.ch:
+					a.batch = append(a.batch, rec)
+					if len(a.batch) >= batchSize {
+						a.flushBatch()
+					}
+				default:
+					// Final flush: retry the remaining batch immediately instead of
+					// waiting for a future tick that will never come. flushBatch
+					// drops the batch after 3 failed attempts.
+					for len(a.batch) > 0 {
+						a.flushBatch()
+					}
+					return
+				}
 			}
 		}
 	}
@@ -248,9 +261,8 @@ func (a *AsyncDbService) flushBatch() {
 }
 
 func sendSafe(ch chan ObjectRecord, rec ObjectRecord) (sent bool) {
-	// The select with a default never panics on a closed (or nil) channel,
-	// so no recover is needed. Swallowing arbitrary panics here would mask
-	// real programming errors.
+	// ch 永远不会被关闭（Close 通过 done 信号停止 worker），所以这里的
+	// 非阻塞发送不会 panic；channel 满时返回 false，由调用方记录丢弃。
 	select {
 	case ch <- rec:
 		return true
@@ -272,6 +284,10 @@ func (a *AsyncDbService) RecordObject(rec ObjectRecord) error {
 }
 
 // Close flushes remaining records and shuts down the worker.
+// 通过 done 信号通知 worker 排空并退出，而不是关闭 ch——
+// 关闭 ch 后并发的 RecordObject 发送会 panic（Go 向已关闭 channel 发送必 panic），
+// 例如 SaveOnSignal 在 worker 仍在运行时调用 Close 的场景。
+// Close 返回后再调用 RecordObject 的记录会被静默丢弃（channel 不再被消费）。
 func (a *AsyncDbService) Close() error {
 	a.mu.Lock()
 	if a.closed {
@@ -279,7 +295,7 @@ func (a *AsyncDbService) Close() error {
 		return nil
 	}
 	a.closed = true
-	close(a.ch)
+	close(a.done)
 	a.mu.Unlock()
 	a.wg.Wait()
 	a.mu.Lock()

@@ -104,7 +104,6 @@ flowchart TD
 - **`--scan`**：只对比不复制。源侧流式 List，目标侧 Head 判断 `matches/differs/missing`；第二阶段 List 目标侧找 `extra`。结果写 `scan_jobs`/`scan_sync` 或 CSV。List 结果缺少 Content-Type/metadata 时会 fallback 到源 Head。
 - **`--scan-single`**：只扫描单个源桶，不访问目标；通过 ListObjects 记录 key/size/mtime/storage_class 到 `single_scan_jobs`/`single_scan` 或 CSV。
 - **`--fix-meta`**：只修同 size 对象的 Content-Type/metadata；在正常同步 pipeline 启动前直接返回，不复制数据；不依赖 S3 self-copy，统一走 `Get` + `PutWithMeta`，避免 COPY directive 造成的假成功。
-- **`--retry-failed`**：要求 `--db`。启用 gate 时，失败/跳过记录会进入第二层重试，成功且 mtime 未变的记录被第一层跳过。
 - **`--double-check`**：正常同步结束后再做一遍查漏，捕捉迁移期间新增或变化的对象。
 
 ## 5. 数据表
@@ -123,7 +122,7 @@ gate 表关键字段：`id`（自增主键）、`key_hash`（key 的 MD5，唯�
 
 - checkpoint 保存前会对 `PrefixState`、multipart uploads、delay-delete 列表做深拷贝快照，避免和 producer/worker 并发读写 `json.Marshal` 竞争。
 - SIGINT/SIGTERM 会保存 checkpoint，并 flush `syncDbService`、`gateBuf`、CSV，然后退出。
-- `--max-failure` 达到阈值会执行收尾并退出；普通失败会写 DB/gate 失败记录，供后续 `--retry-failed` 或下一次增量重试。
+- `--max-failure` 达到阈值会执行收尾并退出；普通失败会写 DB/gate 失败记录，供下一次增量重试。
 - `--limit` 使用原子计数，多 producer/worker 并发下不会超扣。
 
 ## 7. 使用建议

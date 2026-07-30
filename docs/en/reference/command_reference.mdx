@@ -997,7 +997,6 @@ In which:
 |`--output`|Write scan/scan-single results to a CSV file.|
 |`--double-check`|Run a second pass after sync to catch objects added during migration.|
 |`--fix-meta`|Fix Content-Type/metadata for same-size objects without copying data; returns before the normal sync pipeline starts.|
-|`--retry-failed`|Requires `--db`/gate: retries failed/skipped gate records while successful objects with unchanged source mtime are skipped by the first gate.|
 |`--gate-table`|Custom table for two-layer gate records; defaults to `sync_records_v2_<hash>` generated from src/dst.|
 
 #### Storage related options {#sync-storage-related-options}
