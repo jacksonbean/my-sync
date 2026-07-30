@@ -793,6 +793,19 @@ func recordSyncObject(jobID, key string, size int64, startTime time.Time, status
 	})
 }
 
+// recordDeleteResult 记录删除任务结果：失败记 failed（带错误信息），成功记 deleted。
+// size 必须由调用方用 withoutSize(obj).Size() 还原（obj.Size() 是负数任务标记）。
+func recordDeleteResult(key string, size int64, err error) {
+	if syncDbService == nil {
+		return
+	}
+	if err != nil {
+		recordSyncObject(syncDbJobID, key, size, time.Now(), sync_db.StatusFailed, err.Error())
+	} else {
+		recordSyncObject(syncDbJobID, key, size, time.Now(), sync_db.StatusDeleted, "")
+	}
+}
+
 type withProgress struct {
 	r io.Reader
 }
@@ -1210,14 +1223,10 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 		switch obj.Size() {
 		case markDeleteSrc:
 			taskErr = deleteObj(src, key, config.Dry)
-			if syncDbService != nil {
-				recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusDeleted, "")
-			}
+			recordDeleteResult(key, withoutSize(obj).Size(), taskErr)
 		case markDeleteDst:
 			taskErr = deleteObj(dst, key, config.Dry)
-			if syncDbService != nil {
-				recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusDeleted, "")
-			}
+			recordDeleteResult(key, withoutSize(obj).Size(), taskErr)
 		case markCopyPerms:
 			if config.Dry {
 				logger.Debugf("Will copy permissions for %s", key)
@@ -1251,6 +1260,10 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 					}
 					break
 				} else if equal {
+					// 统一在出口记录一次 DB，状态由分支决定，避免分支内重复记录
+					// （此前 perms 分支会记两次，Head 失败时还会 failed+skipped 矛盾双行）。
+					status := sync_db.StatusSkipped
+					errMsg := ""
 					if config.DeleteSrc {
 						if obj.IsDir() {
 							srcDelayDelMu.Lock()
@@ -1258,6 +1271,12 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 							srcDelayDelMu.Unlock()
 						} else {
 							taskErr = deleteObj(src, key, false)
+						}
+						if taskErr != nil {
+							status = sync_db.StatusFailed
+							errMsg = taskErr.Error()
+						} else {
+							status = sync_db.StatusDeleted
 						}
 					} else if config.Perms && (!obj.IsSymlink() || !config.Links) {
 						if o, e := dst.Head(ctx, key); e == nil {
@@ -1268,23 +1287,19 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 								skipped.Increment()
 								skippedBytes.IncrInt64(obj.Size())
 							}
-							if syncDbService != nil {
-								recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusSkipped, "")
-							}
 						} else {
 							logger.Warnf("Failed to head object %s: %s", key, e)
 							failed.Increment()
 							taskErr = e
-							if syncDbService != nil {
-								recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusFailed, e.Error())
-							}
+							status = sync_db.StatusFailed
+							errMsg = e.Error()
 						}
 					} else {
 						skipped.Increment()
 						skippedBytes.IncrInt64(obj.Size())
 					}
 					if syncDbService != nil {
-						recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusSkipped, "")
+						recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), status, errMsg)
 					}
 					break
 				}
