@@ -1,7 +1,10 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"net/http"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
@@ -60,20 +63,25 @@ func setup(c *cli.Context, n int) {
 	setup0(c, n, n)
 }
 
-func exposeMetrics(c *cli.Context, registerer prometheus.Registerer, registry *prometheus.Registry) string {
+func exposeMetrics(c *cli.Context, registerer prometheus.Registerer, registry *prometheus.Registry) (string, func() error) {
 	addr := c.String("metrics")
 	if addr == "" {
-		return ""
+		return "", nil
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
 		logger.Infof("metrics server listening on %s", addr)
-		if err := http.ListenAndServe(addr, mux); err != nil {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Warnf("metrics server error: %v", err)
 		}
 	}()
-	return addr
+	return addr, func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return srv.Shutdown(ctx)
+	}
 }
 
 // removePassword is deprecated; use utils.RemovePassword for credential masking.

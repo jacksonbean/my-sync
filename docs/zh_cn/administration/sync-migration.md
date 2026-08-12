@@ -109,6 +109,7 @@ flowchart TD
 ## 5. 数据表
 
 - 普通同步 job：`sync_jobs.sync_jobs`；对象明细：`juicefs_sync.objects_<job_id>`。job ID 时间戳精确到微秒并对超长 bucket/path 做哈希截断，避免同分钟冲突或 MySQL 表名超长；`StartJob` 失败会直接返回错误，不再继续跑然后静默丢明细。
+  - 默认只写入 `copied` 和 `failed` 两种状态的明细，`skipped` 不写入，可显著降低 `--ignore-existing` 场景下的 MySQL 压力。通过 `--db-record-status` 可调整，例如 `--db-record-status=copied,skipped,failed,deleted` 恢复旧行为。
 - scan job：`scan_jobs.sync_jobs`；明细：`scan_sync.objects_<job_id>`。
 - scan-single job：`single_scan_jobs.sync_jobs`；明细：`single_scan.scan_<job_id>`。
 - gate：`NewGateService` 使用 `--db` DSN path 指定的数据库，表为 `--gate-table` 或 `sync_records_v2_<hash>`。因此 DSN 需要带 database，例如 `mysql://user:pass@host:3306/juicefs_gate`。

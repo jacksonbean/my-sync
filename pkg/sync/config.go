@@ -85,6 +85,7 @@ type Config struct {
 	Scan                 bool
 	ScanSingle           bool
 	OutputFile           string
+	DbRecordStatus       []string
 	// Dashboard removed
 	DoubleCheck bool
 	FixMeta     bool
@@ -244,6 +245,7 @@ func NewConfigFromCli(c *cli.Context) *Config {
 		Scan:                 c.Bool("scan"),
 		ScanSingle:           c.Bool("scan-single"),
 		OutputFile:           c.String("output"),
+		DbRecordStatus:       c.StringSlice("db-record-status"),
 		DoubleCheck:          c.Bool("double-check"),
 		FixMeta:              c.Bool("fix-meta"),
 		Env:                  make(map[string]string),

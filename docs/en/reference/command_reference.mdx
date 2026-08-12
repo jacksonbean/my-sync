@@ -992,6 +992,7 @@ In which:
 |`--checkpoint-force-reset`|Start the sync from scratch and overwrite the existing checkpoint.|
 |`--preserve-meta`|Preserve source Content-Type and user-defined metadata, default to false.|
 |`--db`|Record sync/scan results to MySQL, for example `mysql://user:pass@host:3306/dbname`; when the two-layer gate is enabled, the DSN must include a database name.|
+|`--db-record-status`|Comma-separated object statuses to record in the `--db` detail table, default `copied,failed`; normal sync supports `copied/skipped/failed/deleted`, scan/scan-single additionally supports `missing/differs/matches/extra`.|
 |`--scan`|Compare source and destination without copying; write results to `--db` or `--output`.|
 |`--scan-single`|Scan a single source bucket only, without accessing destination, and record key/size/mtime/storage_class via ListObjects.|
 |`--output`|Write scan/scan-single results to a CSV file.|

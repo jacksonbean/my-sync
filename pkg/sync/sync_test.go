@@ -24,11 +24,13 @@ import (
 	"math"
 	"os"
 	"reflect"
+	stdsync "sync"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
+	sync_db "github.com/juicedata/juicefs/pkg/sync/db"
 )
 
 func collectAll(c <-chan object.Object) []string {
@@ -988,5 +990,130 @@ func TestSyncEncryptLargeFile(t *testing.T) {
 	got, _ := io.ReadAll(r)
 	if !bytes.Equal(got, largeData) {
 		t.Fatalf("decrypted large file mismatch: got %d bytes, want %d", len(got), len(largeData))
+	}
+}
+
+// mockDbServiceForSync 用于验证 recordSyncObject 的白名单过滤。
+type mockDbServiceForSync struct {
+	mu      stdsync.Mutex
+	records []sync_db.ObjectRecord
+}
+
+func (m *mockDbServiceForSync) StartJob(job sync_db.JobInfo) error { return nil }
+func (m *mockDbServiceForSync) RecordObject(rec sync_db.ObjectRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.records = append(m.records, rec)
+	return nil
+}
+func (m *mockDbServiceForSync) RecordObjects(recs []sync_db.ObjectRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.records = append(m.records, recs...)
+	return nil
+}
+func (m *mockDbServiceForSync) EndJob(jobID string, job sync_db.JobInfo) error { return nil }
+func (m *mockDbServiceForSync) Close() error                           { return nil }
+
+func (m *mockDbServiceForSync) count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.records)
+}
+
+func (m *mockDbServiceForSync) statuses() []sync_db.ObjectStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]sync_db.ObjectStatus, len(m.records))
+	for i, r := range m.records {
+		out[i] = r.Status
+	}
+	return out
+}
+
+func TestParseDbRecordStatus(t *testing.T) {
+	// 空值：不过滤
+	set, err := parseDbRecordStatus(nil, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if set != nil {
+		t.Fatalf("expected nil set for empty input, got %v", set)
+	}
+
+	// 普通同步：合法值
+	set, err = parseDbRecordStatus([]string{"copied", "failed"}, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(set) != 2 {
+		t.Fatalf("expected 2 statuses, got %d", len(set))
+	}
+	for _, s := range []sync_db.ObjectStatus{sync_db.StatusCopied, sync_db.StatusFailed} {
+		if _, ok := set[s]; !ok {
+			t.Fatalf("expected status %v in set", s)
+		}
+	}
+
+	// 大小写、空格、去重
+	set, err = parseDbRecordStatus([]string{"  Copied ", "FAILED", "copied"}, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(set) != 2 {
+		t.Fatalf("expected 2 unique statuses, got %d", len(set))
+	}
+
+	// 非法值
+	_, err = parseDbRecordStatus([]string{"copied", "unknown"}, false)
+	if err == nil {
+		t.Fatalf("expected error for invalid status")
+	}
+
+	// scan 模式包含 scan 特有状态
+	set, err = parseDbRecordStatus([]string{"copied", "failed"}, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(set) != 2 {
+		t.Fatalf("expected 2 statuses, got %d", len(set))
+	}
+	_, ok := set[sync_db.StatusMissing]
+	if ok {
+		t.Fatalf("did not expect missing status with explicit copied,failed")
+	}
+}
+
+func TestRecordSyncObjectStatusFilter(t *testing.T) {
+	mock := &mockDbServiceForSync{}
+	syncDbService = sync_db.NewAsyncDbService(mock)
+	defer syncDbService.Close()
+
+	// 默认白名单 copied/failed，skipped 不应写入
+	set, err := parseDbRecordStatus([]string{"copied", "failed"}, false)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	oldSet := dbRecordStatusSet
+	dbRecordStatusSet = set
+	defer func() { dbRecordStatusSet = oldSet }()
+
+	recordSyncObject("job1", "a", 1, time.Now(), sync_db.StatusCopied, "")
+	recordSyncObject("job1", "b", 1, time.Now(), sync_db.StatusFailed, "err")
+	recordSyncObject("job1", "c", 1, time.Now(), sync_db.StatusSkipped, "")
+	recordSyncObject("job1", "d", 1, time.Now(), sync_db.StatusDeleted, "")
+
+	if err := syncDbService.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	if mock.count() != 2 {
+		t.Fatalf("expected 2 recorded objects, got %d", mock.count())
+	}
+	statuses := mock.statuses()
+	for _, s := range statuses {
+		if s != sync_db.StatusCopied && s != sync_db.StatusFailed {
+			t.Fatalf("unexpected status %v recorded", s)
+		}
 	}
 }

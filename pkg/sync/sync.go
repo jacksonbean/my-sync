@@ -77,6 +77,10 @@ var (
 	// 双层门卫全局变量（由 Sync() 初始化，produce/worker 使用）
 	gateSvc sync_db.DbGateService
 	gateBuf *GateRecordBuffer
+
+	// dbRecordStatusSet 控制哪些对象状态会被写入 --db 明细表。
+	// 由 Sync() 根据 config.DbRecordStatus 初始化。
+	dbRecordStatusSet map[sync_db.ObjectStatus]struct{}
 )
 
 type mixedLimiter struct {
@@ -776,10 +780,59 @@ func getSrcMeta(src object.ObjectStorage, key string) (object.ObjectMeta, bool) 
 	}, true
 }
 
+// parseDbRecordStatus 将 CLI 传入的状态字符串解析为 ObjectStatus 集合。
+// 普通同步默认只保留 copied/failed；scan/scan-single 模式会自动包含 scan 特有状态
+//（missing/differs/matches/extra），以兼容旧行为。
+func parseDbRecordStatus(vals []string, isScan bool) (map[sync_db.ObjectStatus]struct{}, error) {
+	// 未显式配置时保持旧行为：不过滤任何状态。
+	if len(vals) == 0 {
+		return nil, nil
+	}
+	allowed := map[string]sync_db.ObjectStatus{
+		"copied":  sync_db.StatusCopied,
+		"skipped": sync_db.StatusSkipped,
+		"failed":  sync_db.StatusFailed,
+		"deleted": sync_db.StatusDeleted,
+	}
+	if isScan {
+		allowed["missing"] = sync_db.StatusMissing
+		allowed["differs"] = sync_db.StatusDiffers
+		allowed["matches"] = sync_db.StatusMatches
+		allowed["extra"] = sync_db.StatusExtra
+	}
+
+	seen := make(map[sync_db.ObjectStatus]struct{})
+	for _, v := range vals {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "" {
+			continue
+		}
+		s, ok := allowed[v]
+		if !ok {
+			return nil, fmt.Errorf("invalid --db-record-status value: %q (allowed: %s)", v, strings.Join(func() []string {
+				keys := make([]string, 0, len(allowed))
+				for k := range allowed {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				return keys
+			}(), ", "))
+		}
+		seen[s] = struct{}{}
+	}
+	return seen, nil
+}
+
 // recordSyncObject sends an object sync result to the db service (non-blocking).
+// 受 dbRecordStatusSet 控制，不在白名单内的状态不会被写入 DB 明细表。
 func recordSyncObject(jobID, key string, size int64, startTime time.Time, status sync_db.ObjectStatus, errMsg string) {
 	if syncDbService == nil {
 		return
+	}
+	if dbRecordStatusSet != nil {
+		if _, ok := dbRecordStatusSet[status]; !ok {
+			return
+		}
 	}
 	_ = syncDbService.RecordObject(sync_db.ObjectRecord{
 		JobID:     jobID,
@@ -2514,6 +2567,14 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 				syncDbService = sync_db.NewAsyncDbService(svc)
 				syncDbJobID = sync_db.GenerateJobID(dst.String(), time.Now())
 				logger.Infof("Syncing to db with job ID: %s", syncDbJobID)
+				statusSet, err := parseDbRecordStatus(config.DbRecordStatus, config.Scan || config.ScanSingle)
+				if err != nil {
+					syncDbService.Close()
+					syncDbService = nil
+					return fmt.Errorf("invalid --db-record-status: %w", err)
+				}
+				dbRecordStatusSet = statusSet
+				logger.Debugf("DB record status filter: %v", config.DbRecordStatus)
 			}
 		}
 	}
@@ -2542,6 +2603,7 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		}
 		gateBuf = nil
 		gateSvc = nil
+		dbRecordStatusSet = nil
 	}()
 
 	// Scan-single mode: list one bucket, record metadata via ListObjects only

@@ -202,6 +202,11 @@ func syncActionFlags() []cli.Flag {
 			Name:  "db",
 			Usage: "record sync results to MySQL database (e.g. mysql://user:pass@host:3306/dbname)",
 		},
+		&cli.StringSliceFlag{
+			Name:  "db-record-status",
+			Usage: "record only the specified object statuses to --db (default: copied,failed)",
+			Value: cli.NewStringSlice("copied", "failed"),
+		},
 		&cli.BoolFlag{
 			Name:  "scan",
 			Usage: "scan-only mode: compare source and dest objects without copying, record results to --db",
@@ -643,7 +648,10 @@ func doSync(c *cli.Context) error {
 			prometheus.WrapRegistererWith(prometheus.Labels{"cmd": "sync", "pid": strconv.Itoa(os.Getpid())}, registry))
 		config.Registerer.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 		config.Registerer.MustRegister(collectors.NewGoCollector())
-		metricsAddr := exposeMetrics(c, config.Registerer, registry)
+		metricsAddr, stopMetrics := exposeMetrics(c, config.Registerer, registry)
+		if stopMetrics != nil {
+			defer stopMetrics()
+		}
 		if c.IsSet("consul") {
 			metadata := make(map[string]string)
 			metadata["src"] = srcPath

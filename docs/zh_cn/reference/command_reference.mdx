@@ -987,6 +987,7 @@ juicefs sync --include='a1/b1' --exclude='a*' --include='b2' --exclude='b?' s3:/
 |`--checkpoint-force-reset`|从头开始同步，并覆盖已有 checkpoint。|
 |`--preserve-meta`|保留源对象的 Content-Type 和用户自定义 metadata，默认为 false。|
 |`--db`|将同步/扫描结果记录到 MySQL，例如 `mysql://user:pass@host:3306/dbname`；启用两层 gate 时 DSN 需要带 database。|
+|`--db-record-status`|指定哪些对象状态写入 `--db` 明细表，逗号分隔，默认为 `copied,failed`；普通同步支持 `copied/skipped/failed/deleted`，scan/scan-single 额外支持 `missing/differs/matches/extra`。|
 |`--scan`|仅对比源和目标，不复制数据，结果写入 `--db` 或 `--output`。|
 |`--scan-single`|仅扫描单个源桶，不访问目标，通过 ListObjects 记录 key/size/mtime/storage_class。|
 |`--output`|将 scan/scan-single 结果输出到 CSV。|
