@@ -105,6 +105,49 @@ func TestCheckpointManagerSaveAndLoad(t *testing.T) {
 	}
 }
 
+// TestCheckpointManagerLocalFile 验证 --checkpoint-file 本地存储模式：
+// 保存/加载/删除都走本地文件，目标存储中不出现 checkpoint 对象。
+func TestCheckpointManagerLocalFile(t *testing.T) {
+	srcStore, _ := object.CreateStorage("mem", "src", "", "", "")
+	store, _ := object.CreateStorage("mem", "", "", "", "")
+	dir := t.TempDir()
+	config := &Config{Start: "a", End: "z", CheckpointFile: dir}
+
+	manager := NewCheckpointManager(srcStore, store, config)
+	ckpt := &Checkpoint{
+		PrefixState: map[string]*PrefixState{
+			"prefix/": {ListDone: true, LastListedKey: "k", FailedKeys: make(map[string]object.Object)},
+		},
+		Config: config,
+		Stats:  CheckpointStats{Copied: 7},
+	}
+	if err := manager.Save(ckpt); err != nil {
+		t.Fatalf("save local checkpoint: %v", err)
+	}
+
+	// 本地模式下目标存储里不应出现 checkpoint 对象
+	if _, err := store.Head(ctx, manager.checkpointKey); !os.IsNotExist(err) {
+		t.Fatalf("dst storage should not contain checkpoint object, got err=%v", err)
+	}
+
+	loader := NewCheckpointManager(srcStore, store, config)
+	loaded, err := loader.Load()
+	if err != nil {
+		t.Fatalf("load local checkpoint: %v", err)
+	}
+	if loaded.Stats.Copied != 7 || loaded.PrefixState["prefix/"] == nil ||
+		loaded.PrefixState["prefix/"].LastListedKey != "k" {
+		t.Fatalf("unexpected loaded checkpoint: %+v", loaded)
+	}
+
+	if err := loader.DeleteCheckpoint(); err != nil {
+		t.Fatalf("delete local checkpoint: %v", err)
+	}
+	if _, err := loader.Load(); !os.IsNotExist(err) {
+		t.Fatalf("expected ErrNotExist after delete, got %v", err)
+	}
+}
+
 func TestCheckpointManagerPrefixStateLifecycle(t *testing.T) {
 	srcStore, _ := object.CreateStorage("mem", "src", "", "", "")
 	store, _ := object.CreateStorage("mem", "", "", "", "")

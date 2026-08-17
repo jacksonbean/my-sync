@@ -41,13 +41,13 @@ func (s *mysqlGateService) createTable() error {
 		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		key_hash CHAR(32) NOT NULL,
 		`+"`key`"+` VARCHAR(768) NOT NULL,
-		source_mtime DATETIME(3) NOT NULL,
+		source_mtime DATETIME NOT NULL,
 		source_size BIGINT DEFAULT 0,
 		target_size BIGINT DEFAULT 0,
 		diff BOOLEAN DEFAULT FALSE,
 		status VARCHAR(16) NOT NULL,
 		error_msg TEXT,
-		updated_at DATETIME(3) NOT NULL,
+		updated_at DATETIME NOT NULL,
 		UNIQUE KEY uk_key_hash (key_hash),
 		INDEX idx_gate (status, source_mtime)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, s.table)

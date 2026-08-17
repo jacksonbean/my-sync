@@ -5,11 +5,11 @@
   "license": "Apache",
   "repository": "github:juicedata/juicefs",
   "scripts": {
-    "autocorrect-lint": "autocorrect --lint ./docs/ README*.md",
-    "autocorrect-lint-fix": "autocorrect --fix ./docs/ README*.md",
-    "check-broken-link": "./node_modules/.bin/remark --quiet --frail ./docs/ README*.md",
-    "markdown-lint": "./node_modules/.bin/markdownlint-cli2 './docs/**/*.md' README*.md",
-    "markdown-lint-fix": "./node_modules/.bin/markdownlint-cli2 --fix './docs/**/*.md' README*.md"
+    "autocorrect-lint": "autocorrect --lint README*.md",
+    "autocorrect-lint-fix": "autocorrect --fix README*.md",
+    "check-broken-link": "./node_modules/.bin/remark --quiet --frail README*.md",
+    "markdown-lint": "./node_modules/.bin/markdownlint-cli2 README*.md",
+    "markdown-lint-fix": "./node_modules/.bin/markdownlint-cli2 --fix README*.md"
   },
   "dependencies": {
     "markdownlint-cli2": "^0.17.2",

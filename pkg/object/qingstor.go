@@ -72,6 +72,8 @@ func (q *qingstor) Head(ctx context.Context, key string) (Object, error) {
 		if e, ok := err.(*errors.QingStorError); ok && e.StatusCode == http.StatusNotFound {
 			return nil, os.ErrNotExist
 		}
+		// 非 404 错误时 r 为 nil，直接返回，避免解引用 panic
+		return nil, err
 	}
 	return &objWithMeta{
 		obj: obj{

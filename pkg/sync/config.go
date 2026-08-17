@@ -79,16 +79,17 @@ type Config struct {
 	EnableCheckpoint     bool
 	CheckpointInterval   time.Duration
 	CheckpointForceReset bool
+	CheckpointFile       string
 	PreserveMeta         bool
 	DbDSN                string
 	GateTable            string
 	Scan                 bool
 	ScanSingle           bool
 	OutputFile           string
+	FullKey              bool
 	DbRecordStatus       []string
-	// Dashboard removed
-	DoubleCheck bool
-	FixMeta     bool
+	DoubleCheck          bool
+	FixMeta              bool
 
 	rules          []rule
 	concurrentList chan int              `json:"-"`
@@ -239,12 +240,14 @@ func NewConfigFromCli(c *cli.Context) *Config {
 		EnableCheckpoint:     c.Bool("enable-checkpoint"),
 		CheckpointInterval:   c.Duration("checkpoint-interval"),
 		CheckpointForceReset: c.Bool("checkpoint-force-reset"),
+		CheckpointFile:       c.String("checkpoint-file"),
 		PreserveMeta:         c.Bool("preserve-meta"),
 		DbDSN:                c.String("db"),
 		GateTable:            c.String("gate-table"),
 		Scan:                 c.Bool("scan"),
 		ScanSingle:           c.Bool("scan-single"),
 		OutputFile:           c.String("output"),
+		FullKey:              c.Bool("full-key"),
 		DbRecordStatus:       c.StringSlice("db-record-status"),
 		DoubleCheck:          c.Bool("double-check"),
 		FixMeta:              c.Bool("fix-meta"),
@@ -262,6 +265,9 @@ func NewConfigFromCli(c *cli.Context) *Config {
 	if cfg.Threads <= 0 {
 		logger.Warnf("threads should be larger than 0, reset it to 1")
 		cfg.Threads = 1
+	}
+	if cfg.CheckpointFile != "" && !cfg.EnableCheckpoint {
+		logger.Warnf("--checkpoint-file is set but --enable-checkpoint is off; checkpoint will not be used")
 	}
 	for _, key := range envList() {
 		if os.Getenv(key) != "" {

@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
+	sync_db "github.com/juicedata/juicefs/pkg/sync/db"
 )
 
 const (
@@ -148,6 +150,7 @@ type CheckpointManager struct {
 	dst              object.ObjectStorage
 	checkpoint       *Checkpoint
 	checkpointKey    string
+	localPath        string // 非空时 checkpoint 存本地文件（单机模式），不再写目标桶
 	stopChan         chan struct{}
 	stopOnce         sync.Once
 	periodicDone     chan struct{}
@@ -168,11 +171,18 @@ func newCheckpoint(config *Config) *Checkpoint {
 // NewCheckpointManager creates a new checkpoint manager
 func NewCheckpointManager(src, dst object.ObjectStorage, config *Config) *CheckpointManager {
 	checkpoint := newCheckpoint(config)
+	key := generateCheckpointKey(src.String(), dst.String(), config)
+	var localPath string
+	if config != nil && config.CheckpointFile != "" {
+		// 单机模式：断点存本地目录（--checkpoint-file），不在目标桶产生 checkpoint 对象
+		localPath = filepath.Join(config.CheckpointFile, key)
+	}
 	return &CheckpointManager{
 		multipartUploadStore: newMultipartUploadStore(checkpoint.MultipartUploads),
 		dst:                  object.DirStorage(dst),
 		checkpoint:           checkpoint,
-		checkpointKey:        generateCheckpointKey(src.String(), dst.String(), config),
+		checkpointKey:        key,
+		localPath:            localPath,
 		stopChan:             make(chan struct{}),
 	}
 }
@@ -234,22 +244,32 @@ func (m *CheckpointManager) cleanupCheckpointTmp() {
 	}
 }
 
-// Load loads checkpoint from object storage
+// Load loads checkpoint from object storage or a local file (--checkpoint-file)
 func (m *CheckpointManager) Load() (*Checkpoint, error) {
-	go m.cleanupCheckpointTmp()
-	obj, err := m.dst.Get(ctx, m.checkpointKey, 0, -1)
-	if err != nil {
-		// head to wrap 404 as os.ErrNotExist
-		if _, err := m.dst.Head(ctx, m.checkpointKey); os.IsNotExist(err) {
+	var data []byte
+	var err error
+	if m.localPath != "" {
+		// 本地模式：直接读文件；不存在的 PathError 天然满足 os.IsNotExist
+		data, err = os.ReadFile(m.localPath)
+		if err != nil {
 			return nil, err
 		}
-		return nil, err
-	}
-	defer obj.Close()
+	} else {
+		go m.cleanupCheckpointTmp()
+		obj, err := m.dst.Get(ctx, m.checkpointKey, 0, -1)
+		if err != nil {
+			// head to wrap 404 as os.ErrNotExist
+			if _, err := m.dst.Head(ctx, m.checkpointKey); os.IsNotExist(err) {
+				return nil, err
+			}
+			return nil, err
+		}
+		defer obj.Close()
 
-	data, err := io.ReadAll(obj)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read checkpoint: %w", err)
+		data, err = io.ReadAll(obj)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read checkpoint: %w", err)
+		}
 	}
 
 	var ckpt Checkpoint
@@ -335,11 +355,30 @@ func (m *CheckpointManager) Save(ckpt *Checkpoint) error {
 
 	logger.Debugf("Saving checkpoint with %d prefixes, copied: %d, failed: %d",
 		len(snap.PrefixState), snap.Stats.Copied, snap.Stats.Failed)
+	if m.localPath != "" {
+		return m.saveLocal(data)
+	}
 	reader := bytes.NewReader(data)
 	if err := m.dst.Put(ctx, m.checkpointKey, reader); err != nil {
 		return fmt.Errorf("failed to put checkpoint: %w", err)
 	}
 
+	return nil
+}
+
+// saveLocal writes the checkpoint JSON to a local file atomically
+// (write temp + rename)，crash 时不会留下半个 checkpoint 文件。
+func (m *CheckpointManager) saveLocal(data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(m.localPath), 0o755); err != nil {
+		return fmt.Errorf("failed to create checkpoint dir: %w", err)
+	}
+	tmp := m.localPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return fmt.Errorf("failed to write local checkpoint: %w", err)
+	}
+	if err := os.Rename(tmp, m.localPath); err != nil {
+		return fmt.Errorf("failed to rename local checkpoint: %w", err)
+	}
 	return nil
 }
 
@@ -789,6 +828,9 @@ func (m *CheckpointManager) Stop() {
 func (m *CheckpointManager) DeleteCheckpoint() error {
 	m.saveMu.Lock()
 	defer m.saveMu.Unlock()
+	if m.localPath != "" {
+		return os.Remove(m.localPath)
+	}
 	return m.dst.Delete(ctx, m.checkpointKey)
 }
 
@@ -827,8 +869,8 @@ func (m *CheckpointManager) SaveOnSignal() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		<-sigChan
-		logger.Infof("Received signal, saving checkpoint...")
+		sig := <-sigChan
+		logger.Infof("Received signal %s, saving checkpoint...", sig)
 		m.Stop()
 
 		if err := m.Save(m.checkpoint); err != nil {
@@ -840,6 +882,24 @@ func (m *CheckpointManager) SaveOnSignal() {
 		// Flush any pending async DB writes before exiting
 		if syncDbService != nil {
 			_ = syncDbService.Close()
+			// 信号中断也要标记 job 结束，否则 jobs 表永久残留 running。
+			// Close 只停异步队列，底层连接仍可用，EndJob 正常生效。
+			// 计数器在 Sync 初始化过程中才创建，这里做 nil 保护，
+			// 防止信号在初始化早期到达时 panic。
+			job := sync_db.JobInfo{ID: syncDbJobID, Status: sync_db.JobFailed, EndTime: time.Now()}
+			if handled != nil {
+				job.TotalObjects = handled.GetTotal()
+			}
+			if copied != nil {
+				job.CopiedObjects = copied.Current()
+			}
+			if copiedBytes != nil {
+				job.TotalBytes = copiedBytes.Current()
+			}
+			if skipped != nil {
+				job.SkippedObjects = skipped.Current()
+			}
+			_ = syncDbService.EndJob(syncDbJobID, job)
 		}
 		if gateBuf != nil {
 			_ = gateBuf.Close()
@@ -851,7 +911,12 @@ func (m *CheckpointManager) SaveOnSignal() {
 			_ = outputCSVFile.Close()
 		}
 
-		os.Exit(0)
+		// 按 POSIX 约定退出：128 + 信号值（SIGINT → 130，SIGTERM → 143），
+		// 让外层脚本 / cron / 编排系统能识别"被中断"而不是"成功完成"。
+		if s, ok := sig.(syscall.Signal); ok {
+			os.Exit(128 + int(s))
+		}
+		os.Exit(1)
 	}()
 }
 

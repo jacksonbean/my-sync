@@ -85,6 +85,10 @@ func (t *tosClient) Get(ctx context.Context, key string, off, limit int64, gette
 	}
 	if off == 0 && limit == -1 {
 		v, _ := resp.Meta.Get(checksumAlgr)
+		if v == "" {
+			// TOS SDK 读取响应时会把 meta key 小写化，按大写键取会静默失效
+			v, _ = resp.Meta.Get(strings.ToLower(checksumAlgr))
+		}
 		resp.Content = verifyChecksum(resp.Content, v, resp.ContentLength)
 	}
 
@@ -152,6 +156,7 @@ func (t *tosClient) Head(ctx context.Context, key string) (Object, error) {
 	var status string
 	rInfo := head.RestoreInfo
 	if rInfo != nil {
+		// RestoreStatus 是值类型（非指针），直接解引用安全
 		status = fmt.Sprintf("OngoingRequest:%v,ExpiryDate:%s", rInfo.RestoreStatus.OngoingRequest, rInfo.RestoreStatus.ExpiryDate)
 	}
 	return &objWithMeta{

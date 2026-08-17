@@ -86,6 +86,8 @@ func (f *sftpStore) sftpConnection() (c *conn, err error) {
 	}
 	sshc, chans, reqs, err := ssh.NewClientConn(conn, net.JoinHostPort(f.host, f.port), f.config)
 	if err != nil {
+		// SSH 握手失败时 raw TCP 连接不会被 NewClientConn 关闭，必须手动释放
+		_ = conn.Close()
 		return nil, err
 	}
 	c.sshClient = ssh.NewClient(sshc, chans, reqs)
@@ -549,6 +551,7 @@ func newSftp(endpoint, username, pass, token string) (ObjectStorage, error) {
 		if err != nil {
 			logger.Errorf("Failed to open SSH_AUTH_SOCK: %v", err)
 		} else {
+			defer conn.Close() // agent 连接用完必须关闭，否则每次 newSftp 泄漏一个 fd
 			agent := agent.NewClient(conn)
 			signer, err := agent.Signers()
 			if err != nil {

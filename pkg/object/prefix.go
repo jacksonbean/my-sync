@@ -50,6 +50,15 @@ func WithPrefix(os ObjectStorage, prefix string) ObjectStorage {
 	return &withPrefix{os, prefix}
 }
 
+// GetPrefix returns the prefix wrapped by WithPrefix (empty if not wrapped).
+// 用于把被剥离前缀的相对 key 还原成完整 key（如 --scan-single --full-key）。
+func GetPrefix(st ObjectStorage) string {
+	if p, ok := st.(*withPrefix); ok {
+		return p.prefix
+	}
+	return ""
+}
+
 // DirStorage returns an ObjectStorage representing the parent directory of s.
 // If s already represents a directory (String() ends with "/"), it is returned unchanged.
 // For file-like storages, returns a new storage rooted at the parent directory.
@@ -257,7 +266,11 @@ func (p *withPrefix) CompleteUpload(ctx context.Context, key string, uploadID st
 func (p *withPrefix) ListUploads(ctx context.Context, marker string) ([]*PendingPart, string, error) {
 	parts, nextMarker, err := p.os.ListUploads(ctx, marker)
 	for _, part := range parts {
-		part.Key = part.Key[len(p.prefix):]
+		// 防御：multipart 记录理论上都带前缀，但后端实现异常时可能不含；
+		// 直接切片会 panic，这里跳过而不是崩溃
+		if len(part.Key) >= len(p.prefix) && strings.HasPrefix(part.Key, p.prefix) {
+			part.Key = part.Key[len(p.prefix):]
+		}
 	}
 	return parts, nextMarker, err
 }

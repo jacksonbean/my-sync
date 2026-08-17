@@ -100,16 +100,19 @@ func (c *etcdClient) Delete(ctx context.Context, key string, getters ...AttrGett
 	return err
 }
 
+// genNextKey returns the smallest key greater than the given one,
+// used as the exclusive end of a range query.
 func genNextKey(key string) string {
 	next := make([]byte, len(key))
 	copy(next, key)
-	p := len(next) - 1
-	next[p]++
-	for next[p] == 0 {
-		p--
+	for p := len(next) - 1; p >= 0; p-- {
 		next[p]++
+		if next[p] != 0 {
+			return string(next)
+		}
 	}
-	return string(next)
+	// key 为空或全为 0xFF：追加一个 0x00 字节得到比原 key 大的最小 key
+	return key + "\x00"
 }
 
 func (c *etcdClient) List(ctx context.Context, prefix, start, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {

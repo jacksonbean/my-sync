@@ -184,8 +184,8 @@ func (s *ibmcos) Head(ctx context.Context, key string) (Object, error) {
 			size:   *r.ContentLength,
 			mtime:  *r.LastModified,
 			isDir:  strings.HasSuffix(key, "/"),
-			sc:     *r.StorageClass,
-			status: *r.Restore,
+			sc:     aws.StringValue(r.StorageClass), // 普通对象 StorageClass 为 nil，直接解引用会 panic
+			status: aws.StringValue(r.Restore),
 		},
 		contentType: aws.StringValue(r.ContentType),
 		metadata:    stringPtrMapToStringMap(r.Metadata),

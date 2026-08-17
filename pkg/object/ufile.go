@@ -84,11 +84,20 @@ func ufileSigner(req *http.Request, accessKey, secretKey, signName string) {
 }
 
 func (u *ufile) Create(ctx context.Context) error {
-	uri, _ := url.ParseRequestURI(u.endpoint)
+	uri, err := url.ParseRequestURI(u.endpoint)
+	if err != nil {
+		return fmt.Errorf("invalid endpoint %s: %w", u.endpoint, err)
+	}
 	parts := strings.Split(uri.Host, ".")
+	if len(parts) < 2 {
+		return fmt.Errorf("invalid endpoint host %s", uri.Host)
+	}
 	name := parts[0]
 	region := parts[1] // www.cn-bj.ufileos.com
 	if region == "ufile" {
+		if len(parts) < 3 {
+			return fmt.Errorf("invalid endpoint host %s", uri.Host)
+		}
 		region = parts[2] // www.ufile.cn-north-02.ucloud.cn
 	}
 	if strings.HasPrefix(region, "internal") {
@@ -173,12 +182,14 @@ func (u *ufile) Copy(ctx context.Context, dst, src string) error {
 	if err != nil {
 		return copyObj(ctx, u, dst, src)
 	}
+	defer cleanup(resp)
 	if resp.StatusCode != 200 {
 		return copyObj(ctx, u, dst, src)
 	}
 
 	etag := resp.Header["Etag"]
-	if len(etag) < 1 {
+	if len(etag) < 1 || len(etag[0]) < 2 {
+		// ETag 缺失或过短时不能切片 [1:len-1]，回退到整对象复制
 		return copyObj(ctx, u, dst, src)
 	}
 	hash := etag[0][1 : len(etag[0])-1]
@@ -186,7 +197,7 @@ func (u *ufile) Copy(ctx context.Context, dst, src string) error {
 	if len(lens) < 1 {
 		return copyObj(ctx, u, dst, src)
 	}
-	uri := fmt.Sprintf("uploadhit?Hash=%s&FileName=%s&FileSize=%s", hash, dst, lens[0])
+	uri := fmt.Sprintf("uploadhit?Hash=%s&FileName=%s&FileSize=%s", hash, url.QueryEscape(dst), lens[0])
 	resp, err = u.request(ctx, "POST", uri, nil, nil)
 	if err != nil {
 		return copyObj(ctx, u, dst, src)
@@ -302,7 +313,10 @@ func (u *ufile) UploadPart(ctx context.Context, key string, uploadID string, num
 }
 
 func (u *ufile) AbortUpload(ctx context.Context, key string, uploadID string) {
-	_, _ = u.request(ctx, "DELETE", key+"?uploads="+uploadID, nil, nil)
+	resp, err := u.request(ctx, "DELETE", key+"?uploads="+uploadID, nil, nil)
+	if err == nil {
+		_ = resp.Body.Close()
+	}
 }
 
 func (u *ufile) CompleteUpload(ctx context.Context, key string, uploadID string, parts []*Part) error {

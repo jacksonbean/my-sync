@@ -79,8 +79,22 @@ func newOOS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error)
 	}
 	ssl := strings.ToLower(uri.Scheme) == "https"
 	hostParts := strings.Split(uri.Host, ".")
+	if len(hostParts) < 2 {
+		return nil, fmt.Errorf("invalid endpoint host %s", uri.Host)
+	}
 	bucket := hostParts[0]
-	region := hostParts[1][4:]
+	// 形如 bucket.s3.cn-north-1.xstore.ctyun.cn 时 region 取第三段；
+	// 否则（bucket.<region>...）直接取第二段。上游 [4:] 截断会把 "cn-beijing" 截成 "eijing"
+	region := hostParts[1]
+	if hostParts[1] == "s3" || hostParts[1] == "obs" {
+		if len(hostParts) < 3 {
+			return nil, fmt.Errorf("invalid endpoint host %s", uri.Host)
+		}
+		region = hostParts[2]
+	}
+	if len(uri.Host) <= len(bucket)+1 {
+		return nil, fmt.Errorf("invalid endpoint host %s", uri.Host)
+	}
 	endpoint = uri.Scheme + "://" + uri.Host[len(bucket)+1:]
 	forcePathStyle := !strings.Contains(strings.ToLower(endpoint), "xstore.ctyun.cn")
 

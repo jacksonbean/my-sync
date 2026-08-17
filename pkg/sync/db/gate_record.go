@@ -20,13 +20,13 @@ import (
 //	  id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 //	  key_hash CHAR(32) NOT NULL,
 //	  key VARCHAR(768) NOT NULL,
-//	  source_mtime DATETIME(3) NOT NULL,
+//	  source_mtime DATETIME NOT NULL,          -- 为兼容老 MySQL 不保留毫秒
 //	  source_size BIGINT DEFAULT 0,
 //	  target_size BIGINT DEFAULT 0,
 //	  diff BOOLEAN DEFAULT FALSE,
 //	  status VARCHAR(16) NOT NULL,
 //	  error_msg TEXT,
-//	  updated_at DATETIME(3) NOT NULL,
+//	  updated_at DATETIME NOT NULL,
 //	  UNIQUE KEY uk_key_hash (key_hash),
 //	  INDEX idx_gate (status, source_mtime)
 //	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -91,11 +91,9 @@ type DbGateService interface {
 	Close() error
 }
 
-// -------------------- 占位：实现将由子 Agent 完成 --------------------
-// 具体实现（mysqlGateService / sqliteGateService）在 gate_service.go 中编写。
-// 需要复用 mysql.go 中的 *sql.DB 连接，或独立创建。
-// 注意：本项目 go.mod 中已包含 github.com/go-sql-driver/mysql 和 mattn/go-sqlite3，
-// 不需要额外引入 gorm。
+// -------------------- gate 表名解析 --------------------
+// mysqlGateService / sqliteGateService 的具体实现在 gate_service.go。
+// 使用原生 database/sql，不引入 gorm。
 
 // ResolveGateTableName 解析 gate 表名。
 // 规则：

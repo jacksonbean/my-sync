@@ -51,12 +51,12 @@ func ExportRsaPrivateKeyToPem(key *rsa.PrivateKey, passphrase string) string {
 		Bytes: buf,
 	}
 	if passphrase != "" {
-		var err error
 		// nolint:staticcheck
-		block, _ = x509.EncryptPEMBlock(rand.Reader, block.Type, buf, []byte(passphrase), x509.PEMCipherAES256)
+		encrypted, err := x509.EncryptPEMBlock(rand.Reader, block.Type, buf, []byte(passphrase), x509.PEMCipherAES256)
 		if err != nil {
 			panic(err)
 		}
+		block = encrypted
 	}
 	privPEM := pem.EncodeToMemory(block)
 	return string(privPEM)

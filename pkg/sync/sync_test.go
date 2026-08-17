@@ -19,13 +19,14 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/csv"
 	"fmt"
 	"io"
 	"math"
 	"os"
 	"reflect"
-	stdsync "sync"
 	"strings"
+	stdsync "sync"
 	"testing"
 	"time"
 
@@ -1013,7 +1014,7 @@ func (m *mockDbServiceForSync) RecordObjects(recs []sync_db.ObjectRecord) error 
 	return nil
 }
 func (m *mockDbServiceForSync) EndJob(jobID string, job sync_db.JobInfo) error { return nil }
-func (m *mockDbServiceForSync) Close() error                           { return nil }
+func (m *mockDbServiceForSync) Close() error                                   { return nil }
 
 func (m *mockDbServiceForSync) count() int {
 	m.mu.Lock()
@@ -1114,6 +1115,73 @@ func TestRecordSyncObjectStatusFilter(t *testing.T) {
 	for _, s := range statuses {
 		if s != sync_db.StatusCopied && s != sync_db.StatusFailed {
 			t.Fatalf("unexpected status %v recorded", s)
+		}
+	}
+}
+
+// TestScanSingleFullKey 验证 --full-key：CSV 记录完整 key（含 URL 前缀），
+// 默认记录相对前缀的 key。
+func TestScanSingleFullKey(t *testing.T) {
+	store, _ := object.CreateStorage("mem", "", "", "", "")
+	for _, k := range []string{"[a_attax", "[a_atta/y/z", "other"} {
+		if err := store.Put(ctx, k, bytes.NewReader([]byte("d"))); err != nil {
+			t.Fatalf("put %s: %v", k, err)
+		}
+	}
+	wrapped := object.WithPrefix(store, "[a_atta")
+
+	run := func(fullKey bool) []string {
+		f, err := os.CreateTemp("", "scan*.csv")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(f.Name())
+
+		outputCSVFile = f
+		outputCSV = csv.NewWriter(f)
+		oldService := syncDbService
+		syncDbService = nil
+		defer func() {
+			syncDbService = oldService
+			outputCSV = nil
+			outputCSVFile = nil
+		}()
+
+		if err := scanSingle(wrapped, &Config{FullKey: fullKey}); err != nil {
+			t.Fatalf("scanSingle: %v", err)
+		}
+		outputCSV.Flush()
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(f.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var keys []string
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n")[1:] {
+			keys = append(keys, strings.Split(line, ",")[0])
+		}
+		return keys
+	}
+
+	full := run(true)
+	if len(full) != 2 {
+		t.Fatalf("expected 2 scanned keys, got %v", full)
+	}
+	for _, k := range full {
+		if !strings.HasPrefix(k, "[a_atta") {
+			t.Fatalf("full-key mode: expected key with prefix, got %q", k)
+		}
+	}
+
+	rel := run(false)
+	if len(rel) != 2 {
+		t.Fatalf("expected 2 scanned keys, got %v", rel)
+	}
+	for _, k := range rel {
+		if strings.HasPrefix(k, "[a_atta") {
+			t.Fatalf("default mode: expected relative key, got %q", k)
 		}
 	}
 }

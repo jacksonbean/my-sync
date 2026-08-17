@@ -29,6 +29,16 @@ func (m *mockDbService) RecordObjects(recs []ObjectRecord) error {
 func (m *mockDbService) EndJob(jobID string, job JobInfo) error { return nil }
 func (m *mockDbService) Close() error                           { return nil }
 
+// TestAsyncDbServiceUpdateJobProgressFallback 验证：
+// 底层实现不支持原位更新（无 UpdateJobProgress 方法）时静默返回 nil，不误写 end_time。
+func TestAsyncDbServiceUpdateJobProgressFallback(t *testing.T) {
+	a := NewAsyncDbService(&mockDbService{})
+	defer a.Close()
+	if err := a.UpdateJobProgress("job1", JobInfo{ID: "job1", TotalObjects: 42}); err != nil {
+		t.Fatalf("fallback UpdateJobProgress should return nil, got %v", err)
+	}
+}
+
 func (m *mockDbService) count() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()

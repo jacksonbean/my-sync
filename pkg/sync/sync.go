@@ -43,6 +43,7 @@ import (
 	sync_db "github.com/juicedata/juicefs/pkg/sync/db"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juju/ratelimit"
+	"github.com/mattn/go-isatty"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vimeo/go-util/crc32combine"
 )
@@ -205,6 +206,32 @@ var ctx = context.Background()
 var preserveMeta bool
 var syncDbService *sync_db.AsyncDbService
 var syncDbJobID string
+
+// scannedKeys 记录已扫描（incrTotal）但尚未被 skip 或 worker 处理完的对象 key，
+// 用于在同步结束时定位 lost 对象。正常情况下所有 key 都会被及时清除。
+// 为避免亿级同步时内存无界增长，最多跟踪 scannedKeysLimit 个 key（方案 A 上限开关）：
+// 超过上限后不再新增记录（Delete 仍正常执行），lost 诊断退化为"列前 N 个候选 key"。
+var scannedKeys sync.Map
+var scannedKeysCount int64
+
+// scannedKeysLimit 是 lost 诊断跟踪的 key 数量上限。
+// 每 key 约 120-200 字节，100 万条封顶约 120-200MB 内存。
+const scannedKeysLimit = 1_000_000
+
+func trackScannedKey(key string) {
+	if atomic.LoadInt64(&scannedKeysCount) >= scannedKeysLimit {
+		return
+	}
+	if _, loaded := scannedKeys.LoadOrStore(key, struct{}{}); !loaded {
+		atomic.AddInt64(&scannedKeysCount, 1)
+	}
+}
+
+func untrackScannedKey(key string) {
+	if _, loaded := scannedKeys.LoadAndDelete(key); loaded {
+		atomic.AddInt64(&scannedKeysCount, -1)
+	}
+}
 
 // maskStorageURL replaces credentials in a storage URL with *** for safe logging.
 func maskStorageURL(s fmt.Stringer) string {
@@ -781,8 +808,11 @@ func getSrcMeta(src object.ObjectStorage, key string) (object.ObjectMeta, bool) 
 }
 
 // parseDbRecordStatus 将 CLI 传入的状态字符串解析为 ObjectStatus 集合。
-// 普通同步默认只保留 copied/failed；scan/scan-single 模式会自动包含 scan 特有状态
-//（missing/differs/matches/extra），以兼容旧行为。
+// 普通同步的默认值 copied,failed 来自 CLI flag 的 Value（cmd/sync.go），
+// 而非本函数；本函数仅在传入空切片时返回 nil（不过滤）。
+// isScan 为 true 时允许 scan 特有状态（missing/differs/matches/extra）。
+// 注意：该过滤只作用于正常同步路径的 recordSyncObject；
+// scanOnly/scanSingle 直接调用 RecordObject，不经过此过滤。
 func parseDbRecordStatus(vals []string, isScan bool) (map[sync_db.ObjectStatus]struct{}, error) {
 	// 未显式配置时保持旧行为：不过滤任何状态。
 	if len(vals) == 0 {
@@ -1284,7 +1314,7 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 			if config.Dry {
 				logger.Debugf("Will copy permissions for %s", key)
 				if syncDbService != nil {
-					recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusCopied, "")
+					recordSyncObject(syncDbJobID, key, withoutSize(obj).Size(), time.Now(), sync_db.StatusCopied, "")
 				}
 			} else {
 				copyPerms(dst, withoutSize(obj), config)
@@ -1295,7 +1325,7 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 				logger.Debugf("Will compare checksum for %s", key)
 				checked.Increment()
 				if syncDbService != nil {
-					recordSyncObject(syncDbJobID, key, obj.Size(), time.Now(), sync_db.StatusSkipped, "")
+					recordSyncObject(syncDbJobID, key, withoutSize(obj).Size(), time.Now(), sync_db.StatusSkipped, "")
 				}
 				break
 			}
@@ -1435,6 +1465,7 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 		}
 
 		trackCheckpointCompletion(key, taskErr, checkpointMgr, config)
+		untrackScannedKey(key)
 		incrHandled(1)
 		done()
 	}
@@ -1658,6 +1689,7 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 	}()
 
 	skipIt := func(obj object.Object) {
+		untrackScannedKey(obj.Key())
 		if checkpointMgr != nil {
 			checkpointMgr.UpdateLastListedKey(prefix, obj)
 		}
@@ -1709,6 +1741,7 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 			}
 		}
 		incrTotal(1)
+		trackScannedKey(obj.Key())
 
 		if dstobj != nil && obj.Key() > dstobj.Key() {
 			if handleExtraObject(tasks, dstobj, config, checkpointMgr, prefix) {
@@ -2243,8 +2276,8 @@ func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, pr
 	defer func() {
 		<-config.concurrentList
 	}()
-	if atomic.LoadInt64(&config.Limit) == 1 && len(config.rules) == 0 {
-		if produceSingleObject(tasks, src, dst, prefix, config, checkpointMgr) == nil {
+	if atomic.LoadInt64(&config.Limit) == 1 && len(config.rules) == 0 && config.Start != "" {
+		if produceSingleObject(tasks, src, dst, config.Start, config, checkpointMgr) == nil {
 			return nil
 		}
 	}
@@ -2350,7 +2383,8 @@ func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, pr
 }
 
 // scanSingle lists a single bucket and records object metadata via ListObjects (no Head calls).
-func scanSingle(src object.ObjectStorage) error {
+// config.FullKey 为 true 时记录完整 key（含 URL 前缀），否则记录相对前缀的 key。
+func scanSingle(src object.ObjectStorage, config *Config) error {
 	srcObjects, err := listAll(src, "", "", "", true, true)
 	if err != nil {
 		return fmt.Errorf("list source: %w", err)
@@ -2358,27 +2392,33 @@ func scanSingle(src object.ObjectStorage) error {
 
 	var total int64
 	startTime := time.Now()
+	keyPrefix := ""
+	if config.FullKey {
+		keyPrefix = object.GetPrefix(src)
+	}
 
 	if outputCSV != nil {
-		outputCSV.Write([]string{"source_key", "size", "last_modified", "storage_class"})
+		outputCSV.Write([]string{"source_key", "size", "storage_class"})
 	}
 
 	for obj := range srcObjects {
 		if obj == nil {
-			break
+			// listAll 在 listing 失败（如 key 乱序）时发送 nil 哨兵；
+			// 与 scanOnly 保持一致：显式报错，而不是把不完整的结果标记为 completed。
+			return fmt.Errorf("listing source failed, scanned only %d objects", total)
 		}
 		total++
+		key := keyPrefix + obj.Key()
 		if syncDbService != nil {
 			_ = syncDbService.RecordObject(sync_db.ObjectRecord{
 				JobID:        syncDbJobID,
-				SourceKey:    obj.Key(),
+				SourceKey:    key,
 				Size:         obj.Size(),
-				EndTime:      obj.Mtime(),
 				StorageClass: obj.StorageClass(),
 			})
 		}
 		if outputCSV != nil {
-			outputCSV.Write([]string{obj.Key(), fmt.Sprintf("%d", obj.Size()), obj.Mtime().Format("2006-01-02 15:04:05"), obj.StorageClass()})
+			outputCSV.Write([]string{key, fmt.Sprintf("%d", obj.Size()), obj.StorageClass()})
 		}
 
 		if total%10000 == 0 {
@@ -2401,123 +2441,180 @@ func scanSingle(src object.ObjectStorage) error {
 }
 
 // scanOnlyCSV compares source and destination objects and writes results to CSV only (no DB).
+// 与 scanOnly 相同的双 List 归并对比，零 Head 调用；mtime 直接取自 List 返回的 LastModified。
 func scanOnlyCSV(src, dst object.ObjectStorage) error {
 	srcObjects, err := listAll(src, "", "", "", true, true)
 	if err != nil {
 		return fmt.Errorf("list source: %w", err)
 	}
-	outputCSV.Write([]string{"source_key", "size", "content_type", "status"})
+	dstObjects, err := listAll(dst, "", "", "", true, true)
+	if err != nil {
+		return fmt.Errorf("list destination: %w", err)
+	}
+	outputCSV.Write([]string{"source_key", "size", "status"})
 
 	var total int64
-	for obj := range srcObjects {
-		if obj == nil {
+	write := func(key string, size int64, status sync_db.ObjectStatus) {
+		outputCSV.Write([]string{key, fmt.Sprintf("%d", size), string(status)})
+	}
+
+	var scanErr error
+	pull := func(ch <-chan object.Object, name string) (object.Object, bool) {
+		o, ok := <-ch
+		if !ok {
+			return nil, false
+		}
+		if o == nil {
+			scanErr = fmt.Errorf("listing %s failed", name)
+			return nil, false
+		}
+		return o, true
+	}
+
+	srcObj, srcOK := pull(srcObjects, "source")
+	dstObj, dstOK := pull(dstObjects, "destination")
+	for srcOK || dstOK {
+		if scanErr != nil {
 			break
 		}
-		total++
-		key := obj.Key()
-		dstObj, dstErr := dst.Head(ctx, key)
-		status := "missing"
-		if dstErr == nil {
-			if dstObj.Size() == obj.Size() {
-				status = "matches"
+		switch {
+		case !srcOK:
+			write(dstObj.Key(), dstObj.Size(), sync_db.StatusExtra)
+			dstObj, dstOK = pull(dstObjects, "destination")
+		case !dstOK:
+			total++
+			write(srcObj.Key(), srcObj.Size(), sync_db.StatusMissing)
+			srcObj, srcOK = pull(srcObjects, "source")
+		case srcObj.Key() < dstObj.Key():
+			total++
+			write(srcObj.Key(), srcObj.Size(), sync_db.StatusMissing)
+			srcObj, srcOK = pull(srcObjects, "source")
+		case srcObj.Key() > dstObj.Key():
+			write(dstObj.Key(), dstObj.Size(), sync_db.StatusExtra)
+			dstObj, dstOK = pull(dstObjects, "destination")
+		default:
+			total++
+			if srcObj.Size() == dstObj.Size() {
+				write(srcObj.Key(), srcObj.Size(), sync_db.StatusMatches)
 			} else {
-				status = "differs"
+				write(srcObj.Key(), srcObj.Size(), sync_db.StatusDiffers)
 			}
+			srcObj, srcOK = pull(srcObjects, "source")
+			dstObj, dstOK = pull(dstObjects, "destination")
 		}
-		srcMeta, _ := getSrcMeta(src, key)
-		outputCSV.Write([]string{key, fmt.Sprintf("%d", obj.Size()), srcMeta.ContentType, status})
+	}
+	if scanErr != nil {
+		return scanErr
 	}
 	logger.Infof("Scan complete: %d objects written to CSV", total)
 	return nil
 }
 
 // scanOnly compares source and destination objects without copying, recording results to db.
+// 双 List 归并对比：src/dst 均按 key 字典序流式列出，双指针推进，全程零 Head 调用，
+// 速度与 --scan-single 同量级（仅多目标端一遍 List）。
 func scanOnly(src, dst object.ObjectStorage) error {
 	srcObjects, err := listAll(src, "", "", "", true, true)
 	if err != nil {
 		return fmt.Errorf("list source: %w", err)
 	}
+	dstObjects, err := listAll(dst, "", "", "", true, true)
+	if err != nil {
+		return fmt.Errorf("list destination: %w", err)
+	}
 
-	var total, matches, differs, missing, errors, extras int64
+	var total, matches, differs, missing, extras int64
 	startTime := time.Now()
 
 	if outputCSV != nil {
 		outputCSV.Write([]string{"source_key", "size", "content_type", "status"})
 	}
 
-	for obj := range srcObjects {
-		if obj == nil {
-			break
-		}
-		total++
-		key := obj.Key()
-
-		// Head destination
-		dstObj, dstErr := dst.Head(ctx, key)
-		status := sync_db.StatusMissing
-		if dstErr == nil {
-			if dstObj.Size() == obj.Size() {
-				status = sync_db.StatusMatches
-				matches++
-			} else {
-				status = sync_db.StatusDiffers
-				differs++
-			}
-		} else if os.IsNotExist(dstErr) {
-			status = sync_db.StatusMissing
-			missing++
-		} else {
-			status = sync_db.StatusFailed
-			errors++
-		}
-
-		// Record to db
-		_ = syncDbService.RecordObject(sync_db.ObjectRecord{
+	record := func(key string, size int64, status sync_db.ObjectStatus, isExtra bool) {
+		rec := sync_db.ObjectRecord{
 			JobID:     syncDbJobID,
-			SourceKey: key,
-			TargetKey: key,
-			Size:      obj.Size(),
+			Size:      size,
 			Status:    status,
 			StartTime: startTime,
 			EndTime:   time.Now(),
-		})
-
-		if total%1000 == 0 {
-			logger.Infof("Scanned %d objects (matches: %d, differs: %d, missing: %d, errors: %d)",
-				total, matches, differs, missing, errors)
+		}
+		if isExtra {
+			rec.TargetKey = key
+		} else {
+			rec.SourceKey = key
+			rec.TargetKey = key
+		}
+		if syncDbService != nil {
+			_ = syncDbService.RecordObject(rec)
 		}
 		if outputCSV != nil {
-			outputCSV.Write([]string{key, fmt.Sprintf("%d", obj.Size()), "", string(status)})
+			outputCSV.Write([]string{key, fmt.Sprintf("%d", size), "", string(status)})
 		}
 	}
 
-	logger.Infof("Scan complete: %d objects (matches: %d, differs: %d, missing: %d, errors: %d) in %s",
-		total, matches, differs, missing, errors, time.Since(startTime))
-
-	// Phase 2: detect extra objects on destination
-	// No in-memory srcKeys map — use streaming approach
-	dstObjects, dstErr := listAll(dst, "", "", "", true, true)
-	if dstErr == nil {
-		for obj := range dstObjects {
-			if obj == nil {
-				break
-			}
-			key := obj.Key()
-			// Check if src has this key by doing a Head (cheap for most stores)
-			if _, srcErr := src.Head(ctx, key); srcErr != nil {
-				extras++
-				_ = syncDbService.RecordObject(sync_db.ObjectRecord{
-					JobID:     syncDbJobID,
-					TargetKey: key,
-					Size:      obj.Size(),
-					Status:    sync_db.StatusExtra,
-					StartTime: startTime,
-					EndTime:   time.Now(),
-				})
-			}
+	// pull 从已排序的 channel 读取下一个对象；channel 关闭返回 ok=false，
+	// 收到 nil 表示 listing 失败，记录到 scanErr 后停止。
+	var scanErr error
+	pull := func(ch <-chan object.Object, name string) (object.Object, bool) {
+		o, ok := <-ch
+		if !ok {
+			return nil, false
 		}
-		logger.Infof("Extra objects on destination: %d", extras)
+		if o == nil {
+			scanErr = fmt.Errorf("listing %s failed", name)
+			return nil, false
+		}
+		return o, true
 	}
+
+	srcObj, srcOK := pull(srcObjects, "source")
+	dstObj, dstOK := pull(dstObjects, "destination")
+	for srcOK || dstOK {
+		if scanErr != nil {
+			break
+		}
+		switch {
+		case !srcOK:
+			extras++
+			record(dstObj.Key(), dstObj.Size(), sync_db.StatusExtra, true)
+			dstObj, dstOK = pull(dstObjects, "destination")
+		case !dstOK:
+			total++
+			missing++
+			record(srcObj.Key(), srcObj.Size(), sync_db.StatusMissing, false)
+			srcObj, srcOK = pull(srcObjects, "source")
+		case srcObj.Key() < dstObj.Key():
+			total++
+			missing++
+			record(srcObj.Key(), srcObj.Size(), sync_db.StatusMissing, false)
+			srcObj, srcOK = pull(srcObjects, "source")
+		case srcObj.Key() > dstObj.Key():
+			extras++
+			record(dstObj.Key(), dstObj.Size(), sync_db.StatusExtra, true)
+			dstObj, dstOK = pull(dstObjects, "destination")
+		default:
+			total++
+			if srcObj.Size() == dstObj.Size() {
+				matches++
+				record(srcObj.Key(), srcObj.Size(), sync_db.StatusMatches, false)
+			} else {
+				differs++
+				record(srcObj.Key(), srcObj.Size(), sync_db.StatusDiffers, false)
+			}
+			srcObj, srcOK = pull(srcObjects, "source")
+			dstObj, dstOK = pull(dstObjects, "destination")
+		}
+		if total%10000 == 0 && total > 0 {
+			logger.Infof("Scanned %d objects (matches: %d, differs: %d, missing: %d, extra: %d)",
+				total, matches, differs, missing, extras)
+		}
+	}
+	if scanErr != nil {
+		return scanErr
+	}
+
+	logger.Infof("Scan complete: %d objects (matches: %d, differs: %d, missing: %d, extra: %d) in %s",
+		total, matches, differs, missing, extras, time.Since(startTime))
 
 	// Flush async records before marking the job completed.
 	_ = syncDbService.Close()
@@ -2528,7 +2625,7 @@ func scanOnly(src, dst object.ObjectStorage) error {
 		TotalObjects:   total,
 		CopiedObjects:  matches,
 		SkippedObjects: differs,
-		FailedObjects:  errors,
+		FailedObjects:  0,
 		DeletedObjects: missing,
 	})
 	return nil
@@ -2537,6 +2634,8 @@ func scanOnly(src, dst object.ObjectStorage) error {
 // Sync syncs all the keys between to object storage
 func Sync(src, dst object.ObjectStorage, config *Config) error {
 	preserveMeta = config.PreserveMeta
+	scannedKeys = sync.Map{}
+	atomic.StoreInt64(&scannedKeysCount, 0)
 
 	// Init CSV output if configured
 	if config.OutputFile != "" {
@@ -2612,7 +2711,6 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 			return fmt.Errorf("--scan-single requires --db or --output")
 		}
 		if syncDbService != nil {
-			syncDbJobID = sync_db.GenerateJobID(src.String(), time.Now())
 			if err := syncDbService.StartJob(sync_db.JobInfo{
 				ID:        syncDbJobID,
 				SrcURL:    src.String(),
@@ -2621,7 +2719,7 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 				return fmt.Errorf("failed to start single scan: %w", err)
 			}
 		}
-		return scanSingle(src)
+		return scanSingle(src, config)
 	}
 
 	// Scan-only mode: compare without copying
@@ -2758,6 +2856,7 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 	var checkBalanceDone chan struct{}
 	var pendingDone chan struct{}
 	var progressDone chan struct{}
+	var dbProgressDone chan struct{}
 	var failureDone chan struct{}
 	if config.TrafficControlURL != "" {
 		gLimit = &globalLimit{address: config.TrafficControlURL}
@@ -2782,7 +2881,9 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		}
 	}
 
-	noProgressBar := config.Verbose || config.Quiet || config.Manager != ""
+	// nohup/管道等无 TTY 场景也走文本进度：否则进度条输出被静默丢弃，
+	// 后台运行（nohup）时看不到任何进度信息。
+	noProgressBar := config.Verbose || config.Quiet || config.Manager != "" || !isatty.IsTerminal(os.Stdout.Fd())
 	progress := utils.NewProgress(noProgressBar)
 	if noProgressBar {
 		// 无进度条模式下，每 10 秒打印一次文本进度到 stderr
@@ -2817,6 +2918,39 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 	}
 	if config.DeleteSrc || config.DeleteDst || config.DeleteSrcAfter {
 		deleted = progress.AddCountSpinner("Deleted objects")
+	}
+
+	// 运行期间每 10 秒把实时计数（扫描/复制/跳过/失败）原位更新到 sync_jobs 汇总行，
+	// 便于后台运行（nohup）时随时查库了解进度；只更新计数，不动 status/end_time。
+	if syncDbService != nil {
+		dbProgressDone = make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					job := sync_db.JobInfo{
+						ID:             syncDbJobID,
+						TotalObjects:   handled.GetTotal(),
+						CopiedObjects:  copied.Current(),
+						SkippedObjects: skipped.Current(),
+						TotalBytes:     copiedBytes.Current(),
+					}
+					if failed != nil {
+						job.FailedObjects = failed.Current()
+					}
+					if deleted != nil {
+						job.DeletedObjects = deleted.Current()
+					}
+					if err := syncDbService.UpdateJobProgress(syncDbJobID, job); err != nil {
+						logger.Debugf("failed to update db job progress: %v", err)
+					}
+				case <-dbProgressDone:
+					return
+				}
+			}
+		}()
 	}
 
 	if checkpoint != nil {
@@ -2889,8 +3023,29 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 			if failed != nil {
 				msg += fmt.Sprintf(", failed: %d", failed.Current())
 			}
-			if total-handled.Current()-extra.Current() > 0 {
-				msg += fmt.Sprintf(", lost: %d", total-handled.Current()-extra.Current())
+			if lost := total - handled.Current() - extra.Current(); lost > 0 {
+				msg += fmt.Sprintf(", lost: %d", lost)
+				var lostKeys []string
+				scannedKeys.Range(func(k, _ interface{}) bool {
+					if s, ok := k.(string); ok {
+						lostKeys = append(lostKeys, s)
+					}
+					return true
+				})
+				sort.Strings(lostKeys)
+				const lostKeyLimit = 100
+				tracked := atomic.LoadInt64(&scannedKeysCount)
+				note := ""
+				if lost > tracked {
+					note = fmt.Sprintf(", %d not tracked (cap %d)", lost-tracked, scannedKeysLimit)
+				}
+				if len(lostKeys) > lostKeyLimit {
+					logger.Warnf("Lost objects (%d total, showing first %d tracked%s): %v", lost, lostKeyLimit, note, lostKeys[:lostKeyLimit])
+				} else if len(lostKeys) > 0 {
+					logger.Warnf("Lost objects (%d total, %d tracked%s): %v", lost, len(lostKeys), note, lostKeys)
+				} else {
+					logger.Warnf("Lost objects (%d total, none tracked%s)", lost, note)
+				}
 			}
 
 			logger.Info(msg)
@@ -2898,7 +3053,9 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 			if syncDbService != nil {
 				_ = syncDbService.Close()
 				jobStatus := sync_db.JobCompleted
-				if failed != nil && failed.Current() > 0 {
+				if (failed != nil && failed.Current() > 0) || total > handled.Current()+extra.Current() {
+					// 存在失败对象或 lost 对象（已扫描但未被处理）时，
+					// job 标记为 failed，避免把未完成的迁移误判为成功。
 					jobStatus = sync_db.JobFailed
 				}
 				_ = syncDbService.EndJob(syncDbJobID, sync_db.JobInfo{
@@ -2945,6 +3102,32 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 				sendStats(config.Manager, workerUploads)
 			}
 			logger.Infof("This worker process has already completed its tasks")
+			// worker 进程同样会创建 job 行（StartJob 无条件执行），退出前必须
+			// flush async 队列并标记 job 结束，否则 jobs 表会永久残留 running 记录，
+			// 且最后一批（最多 batchSize 条）对象明细会丢失。
+			if syncDbService != nil {
+				_ = syncDbService.Close()
+				_ = syncDbService.EndJob(syncDbJobID, sync_db.JobInfo{
+					ID:            syncDbJobID,
+					Status:        sync_db.JobCompleted,
+					EndTime:       time.Now(),
+					TotalObjects:  handled.GetTotal(),
+					CopiedObjects: copied.Current(),
+					SkippedObjects: func() int64 {
+						if skipped != nil {
+							return skipped.Current()
+						}
+						return 0
+					}(),
+					FailedObjects: func() int64 {
+						if failed != nil {
+							return failed.Current()
+						}
+						return 0
+					}(),
+					TotalBytes: copiedBytes.Current(),
+				})
+			}
 		}
 		return nil
 	}
@@ -3056,6 +3239,9 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 	}
 	if progressDone != nil {
 		close(progressDone)
+	}
+	if dbProgressDone != nil {
+		close(dbProgressDone)
 	}
 	if failureDone != nil {
 		close(failureDone)

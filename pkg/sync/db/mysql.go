@@ -96,8 +96,8 @@ func (s *mysqlService) createJobsTable() error {
 		id VARCHAR(128) PRIMARY KEY,
 		src_url TEXT NOT NULL,
 		dst_url TEXT NOT NULL,
-		start_time DATETIME(3),
-		end_time DATETIME(3),
+		start_time DATETIME,
+		end_time DATETIME,
 		total_objects BIGINT DEFAULT 0,
 		copied_objects BIGINT DEFAULT 0,
 		skipped_objects BIGINT DEFAULT 0,
@@ -117,18 +117,12 @@ func (s *mysqlService) createSingleScanTable(tableName string) error {
 		id BIGINT AUTO_INCREMENT PRIMARY KEY,
 		source_key VARCHAR(2048) NOT NULL,
 		size BIGINT DEFAULT 0,
-		last_modified DATETIME(3),
-		storage_class VARCHAR(64),
-		INDEX idx_key (source_key(768))
+		storage_class VARCHAR(64)
 	) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4`, s.dataDB(), tableName)
 	_, err := s.db.Exec(sql)
 	if err != nil {
 		return err
 	}
-	// Session optimizations (unique_checks, foreign_key_checks) are applied
-	// per-batch inside recordObjectsSingleScan via a transaction, so every
-	// connection in the pool benefits regardless of which connection serves
-	// the Exec call.
 	return nil
 }
 
@@ -143,8 +137,8 @@ func (s *mysqlService) createObjectsTable(tableName string) error {
 		storage_class VARCHAR(64),
 		status VARCHAR(16) NOT NULL,
 		error_msg TEXT,
-		start_time DATETIME(3),
-		end_time DATETIME(3),
+		start_time DATETIME,
+		end_time DATETIME,
 		INDEX idx_status (status)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, s.dataDB(), tableName)
 	_, err := s.db.Exec(sql)
@@ -222,13 +216,13 @@ func (s *mysqlService) RecordObject(rec ObjectRecord) error {
 		return fmt.Errorf("no active job")
 	}
 
-	// Single scan: simplified schema (key, size, last_modified, storage_class)
+	// Single scan: simplified schema (key, size, storage_class)
 	if s.isSingleScan {
 		objectsSQL := fmt.Sprintf(`INSERT INTO `+"`%s`"+`.`+"`%s`"+`
-			(source_key, size, last_modified, storage_class)
-			VALUES (?, ?, ?, ?)`, s.dataDB(), table)
+			(source_key, size, storage_class)
+			VALUES (?, ?, ?)`, s.dataDB(), table)
 		_, err := s.db.Exec(objectsSQL,
-			rec.SourceKey, rec.Size, rec.EndTime, rec.StorageClass)
+			rec.SourceKey, rec.Size, rec.StorageClass)
 		return err
 	}
 
@@ -268,20 +262,8 @@ func (s *mysqlService) recordObjectsSingleScan(recs []ObjectRecord, table string
 	if err != nil {
 		return fmt.Errorf("begin tx for single scan: %w", err)
 	}
-	if _, err := tx.Exec("SET unique_checks = 0"); err != nil {
-		tx.Rollback()
-		return fmt.Errorf("set unique_checks: %w", err)
-	}
-	if _, err := tx.Exec("SET foreign_key_checks = 0"); err != nil {
-		tx.Rollback()
-		return fmt.Errorf("set foreign_key_checks: %w", err)
-	}
 	committed := false
 	defer func() {
-		// Best-effort restore of session-level checks so the connection returned
-		// to the pool does not leak disabled checks to unrelated later statements.
-		_, _ = tx.Exec("SET unique_checks = 1")
-		_, _ = tx.Exec("SET foreign_key_checks = 1")
 		if !committed {
 			tx.Rollback()
 		}
@@ -295,14 +277,14 @@ func (s *mysqlService) recordObjectsSingleScan(recs []ObjectRecord, table string
 		batch := recs[i:end]
 
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("INSERT INTO `%s`.`%s` (source_key, size, last_modified, storage_class) VALUES ", s.dataDB(), table))
-		args := make([]interface{}, 0, len(batch)*4)
+		sb.WriteString(fmt.Sprintf("INSERT INTO `%s`.`%s` (source_key, size, storage_class) VALUES ", s.dataDB(), table))
+		args := make([]interface{}, 0, len(batch)*3)
 		for j, rec := range batch {
 			if j > 0 {
 				sb.WriteString(",")
 			}
-			sb.WriteString("(?, ?, ?, ?)")
-			args = append(args, rec.SourceKey, rec.Size, rec.EndTime, rec.StorageClass)
+			sb.WriteString("(?, ?, ?)")
+			args = append(args, rec.SourceKey, rec.Size, rec.StorageClass)
 		}
 		if _, err := tx.Exec(sb.String(), args...); err != nil {
 			return fmt.Errorf("batch insert single scan: %w", err)
@@ -363,6 +345,15 @@ func (s *mysqlService) EndJob(jobID string, job JobInfo) error {
 	sql := fmt.Sprintf(`UPDATE `+"`%s`"+`.`+"`sync_jobs`"+` SET status = ?, end_time = ?, total_objects = ?, copied_objects = ?, skipped_objects = ?, failed_objects = ?, deleted_objects = ?, total_bytes = ? WHERE id = ?`, s.jobsDB())
 	_, err := s.db.Exec(sql, string(job.Status), job.EndTime,
 		job.TotalObjects, job.CopiedObjects, job.SkippedObjects,
+		job.FailedObjects, job.DeletedObjects, job.TotalBytes, jobID)
+	return err
+}
+
+// UpdateJobProgress updates only the counters of a running job,
+// leaving status and end_time untouched (for live progress queries).
+func (s *mysqlService) UpdateJobProgress(jobID string, job JobInfo) error {
+	sql := fmt.Sprintf(`UPDATE `+"`%s`"+`.`+"`sync_jobs`"+` SET total_objects = ?, copied_objects = ?, skipped_objects = ?, failed_objects = ?, deleted_objects = ?, total_bytes = ? WHERE id = ?`, s.jobsDB())
+	_, err := s.db.Exec(sql, job.TotalObjects, job.CopiedObjects, job.SkippedObjects,
 		job.FailedObjects, job.DeletedObjects, job.TotalBytes, jobID)
 	return err
 }

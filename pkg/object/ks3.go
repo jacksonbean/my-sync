@@ -97,7 +97,7 @@ func (s *ks3) Head(ctx context.Context, key string) (Object, error) {
 			mtime:  *r.LastModified,
 			isDir:  strings.HasSuffix(key, "/"),
 			sc:     sc,
-			status: *r.Restore,
+			status: aws.ToString(r.Restore), // 普通对象 Restore 为 nil，直接解引用会 panic
 		},
 		contentType: aws.ToString(r.ContentType),
 		metadata:    stringPtrMapToStringMap(r.Metadata),

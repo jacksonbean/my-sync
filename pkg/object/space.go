@@ -54,11 +54,20 @@ func newSpace(endpoint, accessKey, secretKey, token string) (ObjectStorage, erro
 	if !strings.Contains(endpoint, "://") {
 		endpoint = fmt.Sprintf("https://%s", endpoint)
 	}
-	uri, _ := url.ParseRequestURI(endpoint)
+	uri, err := url.ParseRequestURI(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("invalid endpoint %s: %s", endpoint, err)
+	}
 	ssl := strings.ToLower(uri.Scheme) == "https"
 	hostParts := strings.Split(uri.Host, ".")
+	if len(hostParts) < 2 {
+		return nil, fmt.Errorf("invalid endpoint host %s", uri.Host)
+	}
 	bucket := hostParts[0]
 	region := hostParts[1]
+	if len(uri.Host) <= len(bucket)+1 {
+		return nil, fmt.Errorf("invalid endpoint host %s", uri.Host)
+	}
 	endpoint = uri.Scheme + "://" + uri.Host[len(bucket)+1:]
 
 	awsCfg, err := config.LoadDefaultConfig(ctx,

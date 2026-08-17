@@ -233,7 +233,7 @@ func (b *wasb) List(ctx context.Context, prefix, startAfter, token, delimiter st
 	}
 
 	var nextMarker string
-	if pager.More() {
+	if pager.More() && page.NextMarker != nil {
 		nextMarker = *page.NextMarker
 	}
 	return objs, pager.More(), nextMarker, nil

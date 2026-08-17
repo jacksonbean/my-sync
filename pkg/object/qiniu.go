@@ -83,6 +83,7 @@ func (q *qiniu) download(key string, off, limit int64) (io.ReadCloser, error) {
 		return nil, err
 	}
 	if resp.StatusCode != 200 && resp.StatusCode != 206 {
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("Status code: %d", resp.StatusCode)
 	}
 	return resp.Body, nil
@@ -191,18 +192,30 @@ func newQiniu(endpoint, accessKey, secretKey, token string) (ObjectStorage, erro
 		return nil, fmt.Errorf("Invalid endpoint: %v, error: %v", endpoint, err)
 	}
 	hostParts := strings.SplitN(uri.Host, ".", 2)
+	if len(hostParts) < 2 {
+		return nil, fmt.Errorf("invalid endpoint host %s", uri.Host)
+	}
 	bucket := hostParts[0]
 	endpoint = hostParts[1]
 	var region string
 	if strings.HasPrefix(endpoint, "s3") {
 		// private region
-		region = endpoint[strings.Index(endpoint, "-")+1 : strings.Index(endpoint, ".")]
+		dash := strings.Index(endpoint, "-")
+		dot := strings.Index(endpoint, ".")
+		if dash < 0 || dot < 0 || dash+1 > dot {
+			return nil, fmt.Errorf("invalid s3 endpoint %s", endpoint)
+		}
+		region = endpoint[dash+1 : dot]
 	} else if strings.HasPrefix(endpoint, "qvm-") {
 		region = "cn-east-1" // internal
 	} else if strings.HasPrefix(endpoint, "qvm-z1") {
 		region = "cn-north-1"
 	} else {
-		region = endpoint[:strings.LastIndex(endpoint, "-")]
+		lastDash := strings.LastIndex(endpoint, "-")
+		if lastDash < 0 {
+			return nil, fmt.Errorf("invalid endpoint %s", endpoint)
+		}
+		region = endpoint[:lastDash]
 	}
 
 	awsCfg, err := config.LoadDefaultConfig(ctx,

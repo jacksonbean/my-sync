@@ -47,14 +47,14 @@ type obj struct {
 	status string
 }
 
-func (o *obj) Key() string              { return o.key }
-func (o *obj) Size() int64              { return o.size }
-func (o *obj) Mtime() time.Time         { return o.mtime }
-func (o *obj) IsDir() bool              { return o.isDir }
-func (o *obj) IsSymlink() bool          { return false }
-func (o *obj) StorageClass() string     { return o.sc }
-func (o *obj) Status() string           { return o.status }
-func (o *obj) ContentType() string      { return "" }
+func (o *obj) Key() string                 { return o.key }
+func (o *obj) Size() int64                 { return o.size }
+func (o *obj) Mtime() time.Time            { return o.mtime }
+func (o *obj) IsDir() bool                 { return o.isDir }
+func (o *obj) IsSymlink() bool             { return false }
+func (o *obj) StorageClass() string        { return o.sc }
+func (o *obj) Status() string              { return o.status }
+func (o *obj) ContentType() string         { return "" }
 func (o *obj) Metadata() map[string]string { return nil }
 
 // objWithMeta extends obj with content-type and user-defined metadata.

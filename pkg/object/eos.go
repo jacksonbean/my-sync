@@ -61,7 +61,13 @@ func newEos(endpoint, accessKey, secretKey, token string) (ObjectStorage, error)
 	}
 	ssl := strings.ToLower(uri.Scheme) == "https"
 	hostParts := strings.Split(uri.Host, ".")
+	if len(hostParts) < 2 {
+		return nil, fmt.Errorf("invalid endpoint host %s", uri.Host)
+	}
 	bucket := hostParts[0]
+	if len(uri.Host) <= len(bucket)+1 {
+		return nil, fmt.Errorf("invalid endpoint host %s", uri.Host)
+	}
 	endpoint = uri.Scheme + "://" + uri.Host[len(bucket)+1:]
 	region := "us-east-1"
 

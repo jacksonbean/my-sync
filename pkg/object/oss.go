@@ -348,18 +348,20 @@ func (o *ossClient) CompleteUpload(ctx context.Context, key string, uploadID str
 }
 
 func (o *ossClient) ListUploads(ctx context.Context, marker string) ([]*PendingPart, string, error) {
-	result, err := o.client.ListParts(ctx, &oss.ListPartsRequest{
-		Bucket: &o.bucket,
-		Key:    &marker,
+	// 之前错调 ListParts（把分页 marker 当对象 Key、缺必填 UploadId），
+	// 这里改为与 s3.go 一致的 ListMultipartUploads
+	result, err := o.client.ListMultipartUploads(ctx, &oss.ListMultipartUploadsRequest{
+		Bucket:    &o.bucket,
+		KeyMarker: &marker,
 	})
 	if err != nil {
 		return nil, "", err
 	}
-	parts := make([]*PendingPart, len(result.Parts))
-	for i, u := range result.Parts {
-		parts[i] = &PendingPart{oss.ToString(result.Key), oss.ToString(result.UploadId), oss.ToTime(u.LastModified)}
+	parts := make([]*PendingPart, len(result.Uploads))
+	for i, u := range result.Uploads {
+		parts[i] = &PendingPart{oss.ToString(u.Key), oss.ToString(u.UploadId), oss.ToTime(u.Initiated)}
 	}
-	return parts, string(result.NextPartNumberMarker), nil
+	return parts, oss.ToString(result.NextKeyMarker), nil
 }
 
 func autoOSSEndpoint(bucketName string, provider credentials.CredentialsProvider) (string, error) {

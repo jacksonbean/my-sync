@@ -173,15 +173,16 @@ func (c *ceph) Put(_ context.Context, key string, in io.Reader, getters ...AttrG
 					return err
 				}
 				off += uint64(n)
-			} else {
-				if err == io.EOF {
-					if off == 0 {
-						return errors.New("ceph: can't put empty file")
-					}
-					return nil
+			} else if err == io.EOF {
+				if off == 0 {
+					return errors.New("ceph: can't put empty file")
 				}
+				return nil
+			} else if err != nil {
 				return err
 			}
+			// n == 0 && err == nil 是 io.Reader 契约允许的空读，
+			// 继续读而不是把未写入任何字节的情况当成功返回
 		}
 	})
 }

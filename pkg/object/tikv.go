@@ -47,7 +47,9 @@ func (t *tikv) String() string {
 
 func (t *tikv) Get(ctx context.Context, key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
 	d, err := t.c.Get(ctx, []byte(key))
-	if len(d) == 0 {
+	// rawkv 对不存在的 key 返回 nil,nil；空对象（合法）返回 []byte{}。
+	// 用 d == nil 判断不存在，与 Head 保持一致，避免 0 字节对象被误判 ErrNotExist
+	if err == nil && d == nil {
 		err = os.ErrNotExist
 	}
 	if err != nil {

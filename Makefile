@@ -7,10 +7,12 @@ REVISIONDATE := $(shell git log -1 --pretty=format:'%cd' --date short 2>/dev/nul
 PKG := github.com/juicedata/juicefs/pkg/version
 GCFLAGS =
 BUILD ?= release
-ifneq ($(strip $(REVISION)),) # Use git clone
-	LDFLAGS += -X $(PKG).revision=$(REVISION) \
-		   -X $(PKG).revisionDate=$(REVISIONDATE)
+ifeq ($(strip $(REVISION)),) # No git repo, use current time
+	REVISION := unknown
+	REVISIONDATE := $(shell date +%Y-%m-%d)
 endif
+LDFLAGS += -X $(PKG).revision=$(REVISION) \
+	   -X $(PKG).revisionDate=$(REVISIONDATE)
 
 ifeq ($(BUILD),release)
 	LDFLAGS += -s -w
@@ -26,41 +28,41 @@ ifdef STATIC
 	export CC
 endif
 
-juicefs: Makefile cmd/*.go pkg/*/*.go go.*
+juicefs: Makefile cmd/*.go pkg/*/*.go pkg/*/*/*.go go.*
 	go version
 	go build -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o juicefs .
 
-juicefs.cover: Makefile cmd/*.go pkg/*/*.go go.*
+juicefs.cover: Makefile cmd/*.go pkg/*/*.go pkg/*/*/*.go go.*
 	go version
 	go build -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -cover -o juicefs .
 
-juicefs.lite: Makefile cmd/*.go pkg/*/*.go
+juicefs.lite: Makefile cmd/*.go pkg/*/*.go pkg/*/*/*.go
 	go build -tags nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd,nocifs,nostorj,noqiniu,notos,noks3 \
 		-gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o juicefs.lite .
 
-juicefs.ceph: Makefile cmd/*.go pkg/*/*.go
+juicefs.ceph: Makefile cmd/*.go pkg/*/*.go pkg/*/*/*.go
 	go build -tags ceph -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o juicefs.ceph .
 
-juicefs.fdb: Makefile cmd/*.go pkg/*/*.go
+juicefs.fdb: Makefile cmd/*.go pkg/*/*.go pkg/*/*/*.go
 	go build -tags fdb -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o juicefs.fdb .
 
-juicefs.fdb.cover: Makefile cmd/*.go pkg/*/*.go
+juicefs.fdb.cover: Makefile cmd/*.go pkg/*/*.go pkg/*/*/*.go
 	go build -tags fdb -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -cover -o juicefs.fdb .
 
-juicefs.gluster: Makefile cmd/*.go pkg/*/*.go
+juicefs.gluster: Makefile cmd/*.go pkg/*/*.go pkg/*/*/*.go
 	go build -tags gluster -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o juicefs.gluster .
 
-juicefs.gluster.cover: Makefile cmd/*.go pkg/*/*.go
+juicefs.gluster.cover: Makefile cmd/*.go pkg/*/*.go pkg/*/*/*.go
 	go build -tags gluster -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -cover -o juicefs.gluster .
 
-juicefs.all: Makefile cmd/*.go pkg/*/*.go
+juicefs.all: Makefile cmd/*.go pkg/*/*.go pkg/*/*/*.go
 	go build -tags ceph,fdb,gluster -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o juicefs.all .
 
 # This is cross-compiling LoongArch in a Linux environment on x86_64 (amd64) or aarch64 (arm64) architecture.
 # 1. Install LoongArch64 cross-compile toolchain from https://github.com/loong64/cross-tools
 # 2. Set CC to your toolchain path.
 # 3. Run `STATIC=1 make juicefs.loongarch` to build the LoongArch binary.
-juicefs.loongarch: Makefile cmd/*.go pkg/*/*.go go.*
+juicefs.loongarch: Makefile cmd/*.go pkg/*/*.go pkg/*/*/*.go go.*
 	CC=bin/loongarch64-unknown-linux-musl-cc CGO_ENABLED=1 GOARCH=loong64 go build -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o juicefs .
 
 # This is the script for compiling the Linux version on the MacOS platform.
@@ -74,7 +76,7 @@ juicefs.linux:
 
 # This is the script for compiling the Windows version on the MacOS platform.
 # Please execute the `brew install mingw-w64` command before using it.
-juicefs.exe: /usr/local/include/winfsp cmd/*.go pkg/*/*.go
+juicefs.exe: /usr/local/include/winfsp cmd/*.go pkg/*/*.go pkg/*/*/*.go
 	GOOS=windows CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc \
 	     go build -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -buildmode exe -o juicefs.exe .
 
@@ -108,21 +110,8 @@ release:
 debug:
 	$(MAKE) BUILD=debug all
 
-test.meta.core:
-	SKIP_NON_CORE=true go test -v -cover -count=1  -failfast -timeout=12m ./pkg/meta/... -args -test.gocoverdir="$(shell realpath cover/)"
-
-test.meta.non-core:
-	go test -v -cover -run='TestRedisCluster|TestPostgreSQLClient|TestLoadDumpSlow|TestEtcdClient|TestKeyDB' -count=1  -failfast -timeout=12m ./pkg/meta/... -args -test.gocoverdir="$(shell realpath cover/)"
-
 test.pkg:
 	go test -tags gluster -v -cover -count=1  -failfast -timeout=12m $$(go list ./pkg/... | grep -v /meta) -args -test.gocoverdir="$(shell realpath cover/)"
 
 test.cmd:
 	sudo JFS_GC_SKIPPEDTIME=1 MINIO_ACCESS_KEY=testUser MINIO_SECRET_KEY=testUserPassword GOMAXPROCS=8 go test -v -count=1 -failfast -cover -timeout=8m ./cmd/... -coverpkg=./pkg/...,./cmd/... -args -test.gocoverdir="$(shell realpath cover/)"
-
-test.fdb:
-	go test -v -cover -count=1  -failfast -timeout=4m ./pkg/meta/ -tags fdb -run=TestFdb -args -test.gocoverdir="$(shell realpath cover/)"
-
-unit-random-test:
-	echo "Using meta:$(meta), seed: $(seed), checks:${checks}, steps: $(steps)"
-	go test ./pkg/meta/... -rapid.meta="$(meta)" -rapid.seed=$(seed) -rapid.checks=$(checks) -rapid.steps=$(steps) -run "TestFSOps" -v -failfast -count=1 -timeout=60m -cover -coverpkg=./pkg/... -args -test.gocoverdir="$(shell realpath cover/)"

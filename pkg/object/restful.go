@@ -235,6 +235,7 @@ func (s *RestfulStorage) request(ctx context.Context, method, key string, body i
 }
 
 func parseError(resp *http.Response) error {
+	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("request failed: %s", err)
@@ -247,10 +248,10 @@ func (s *RestfulStorage) Head(ctx context.Context, key string) (Object, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer cleanup(resp)
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, os.ErrNotExist
 	}
-	defer cleanup(resp)
 	if resp.StatusCode != 200 {
 		return nil, parseError(resp)
 	}

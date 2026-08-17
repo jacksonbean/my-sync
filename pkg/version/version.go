@@ -21,17 +21,18 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
-	revision     = "a0415fb0a962" // value is assigned in Makefile
-	revisionDate = "2026-06-01"
+	revision     = "unknown"
+	revisionDate = "unknown"
 	ver          = Semver{
 		major:      1,
-		minor:      4,
+		minor:      3,
 		patch:      0,
-		preRelease: "dev",
-		build:      fmt.Sprintf("%s.%s", revisionDate, revision),
+		preRelease: "",
+		build:      revisionDate,
 	}
 )
 
@@ -45,10 +46,16 @@ func (s *Semver) String() string {
 	if pr != "" {
 		pr = "-" + pr
 	}
-	if strings.Contains(s.build, "Format") {
-		s.build = "unknown"
+	build := s.build
+	if build == "unknown" {
+		build = time.Now().Format("2006-01-02")
 	}
-	return fmt.Sprintf("%d.%d.%d%s+%s", s.major, s.minor, s.patch, pr, s.build)
+	if revision != "unknown" {
+		// revision 由 Makefile/goreleaser 通过 -ldflags 注入；
+		// 附加到 build 上，使版本号可区分 commit
+		build = build + "." + revision
+	}
+	return fmt.Sprintf("%d.%d.%d%s+%s", s.major, s.minor, s.patch, pr, build)
 }
 
 func Version() string {

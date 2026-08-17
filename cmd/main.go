@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/urfave/cli/v2"
@@ -18,8 +19,8 @@ var cliCtx *cli.Context
 func Main(args []string) error {
 	app := &cli.App{
 		Name:      "juicefs",
-		Usage:     "A POSIX file system built on object storage",
-		Version:   "1.3",
+		Usage:     "A high-performance object storage sync tool (sync-only fork of JuiceFS)",
+		Version:   version.Version(),
 		Copyright: "Apache 2.0",
 		Commands: []*cli.Command{
 			cmdSync(),

@@ -253,7 +253,8 @@ func (s *storjClient) List(ctx context.Context, prefix, startAfter, token, delim
 		return nil, false, "", err
 	}
 	slices.SortFunc(objs, func(a, b Object) int { return cmp.Compare(a.Key(), b.Key()) })
-	if int64(len(objs)) > limit {
+	// limit == -1 表示不限（本仓库通用约定），此时不能对切片做负索引截断
+	if limit >= 0 && int64(len(objs)) > limit {
 		objs = objs[:limit]
 	}
 	return generateListResult(objs, limit)

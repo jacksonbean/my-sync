@@ -31,6 +31,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudsoda/go-smb2"
@@ -213,11 +214,15 @@ type cifsReadCloser struct {
 	io.ReadCloser
 	store *cifsStore
 	conn  *cifsConn
+	once  sync.Once // Close 幂等：重复 Close 不能再次 Logoff 已回池的会话
 }
 
 func (r *cifsReadCloser) Close() error {
-	err := r.ReadCloser.Close()
-	r.store.releaseConnection(r.conn, err)
+	var err error
+	r.once.Do(func() {
+		err = r.ReadCloser.Close()
+		r.store.releaseConnection(r.conn, err)
+	})
 	return err
 }
 
@@ -431,9 +436,13 @@ func (c *cifsStore) List(ctx context.Context, prefix, marker, token, delimiter s
 		}
 		return nil
 	})
-	if os.IsNotExist(err) || os.IsPermission(err) {
-		logger.Warnf("skip %s: %s", dir, err)
-		return nil, false, "", nil
+	if err != nil {
+		if os.IsNotExist(err) || os.IsPermission(err) {
+			logger.Warnf("skip %s: %s", dir, err)
+			return nil, false, "", nil
+		}
+		// 网络/I/O 等其它错误不能吞掉，否则 sync 会把失败当成空目录
+		return nil, false, "", err
 	}
 
 	// Sort entries by name

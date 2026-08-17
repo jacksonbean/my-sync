@@ -55,6 +55,7 @@ func GetLocalIp(address string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	defer conn.Close() // UDP 探测套接字用完必须关闭，避免 fd 泄漏
 	ip, _, err := net.SplitHostPort(conn.LocalAddr().String())
 	if err != nil {
 		return "", err

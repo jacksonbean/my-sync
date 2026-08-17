@@ -65,8 +65,8 @@ Examples:
 # Sync object from OSS to S3
 $ juicefs sync oss://mybucket.oss-cn-shanghai.aliyuncs.com s3://mybucket.s3.us-east-2.amazonaws.com
 
-# Sync objects from S3 to JuiceFS
-$ myfs=redis://localhost juicefs sync s3://mybucket.s3.us-east-2.amazonaws.com/ jfs://myfs/ -p 50
+# Sync objects from S3 to a local directory
+$ juicefs sync s3://mybucket.s3.us-east-2.amazonaws.com/ file:///mnt/data/ -p 50
 
 # SRC: a1/b1,a2/b2,aaa/b1   DST: empty   sync result: aaa/b1
 $ juicefs sync --exclude='a?/b*' s3://mybucket.s3.us-east-2.amazonaws.com/ /mnt/jfs/
@@ -232,6 +232,10 @@ func syncActionFlags() []cli.Flag {
 			Usage: "output scan results to CSV file (use with --scan or --scan-single)",
 		},
 		&cli.BoolFlag{
+			Name:  "full-key",
+			Usage: "record the full object key (including the URL prefix) in --scan-single results, instead of keys relative to the prefix",
+		},
+		&cli.BoolFlag{
 			Name:    "links",
 			Aliases: []string{"l"},
 			Usage:   "copy symlinks as symlinks",
@@ -291,6 +295,10 @@ func syncActionFlags() []cli.Flag {
 			Name:  "checkpoint-interval",
 			Value: 10 * time.Second,
 			Usage: "interval to save checkpoint (default: 10s)",
+		},
+		&cli.StringFlag{
+			Name:  "checkpoint-file",
+			Usage: "store checkpoint in the local directory `DIR` instead of the destination storage (single-machine mode; requires --enable-checkpoint)",
 		},
 	})
 }
@@ -478,7 +486,7 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 	case "virtual-host":
 		isS3PathTypeUrl = false
 	}
-	if name == "minio" || name == "s3" && isS3PathTypeUrl {
+	if name == "minio" || (name == "s3" && isS3PathTypeUrl) {
 		// bucket name is part of path
 		endpoint += u.Path
 	}

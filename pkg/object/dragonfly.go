@@ -216,9 +216,9 @@ func (d *dragonfly) Head(ctx context.Context, key string) (Object, error) {
 		return nil, err
 	}
 
-	u.Path = path.Join("buckets", d.bucket, "objects", key)
+	u.Path = path.Join("buckets", d.bucket, "objects") + "/" + key
 	if strings.HasSuffix(key, "/") {
-		u.Path += "/"
+		u.Path = strings.TrimSuffix(u.Path, "/") + "/"
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, u.String(), nil)
@@ -268,9 +268,9 @@ func (d *dragonfly) Get(ctx context.Context, key string, off, limit int64, gette
 		return nil, err
 	}
 
-	u.Path = path.Join("buckets", d.bucket, "objects", key)
+	u.Path = path.Join("buckets", d.bucket, "objects") + "/" + key
 	if strings.HasSuffix(key, "/") {
-		u.Path += "/"
+		u.Path = strings.TrimSuffix(u.Path, "/") + "/"
 	}
 
 	query := u.Query()
@@ -291,6 +291,7 @@ func (d *dragonfly) Get(ctx context.Context, key string, off, limit int64, gette
 	}
 
 	if resp.StatusCode/100 != 2 {
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("bad response status %s", resp.Status)
 	}
 	attrs := ApplyGetters(getters...)
@@ -339,9 +340,9 @@ func (d *dragonfly) Put(ctx context.Context, key string, data io.Reader, getters
 		return err
 	}
 
-	u.Path = path.Join("buckets", d.bucket, "objects", key)
+	u.Path = path.Join("buckets", d.bucket, "objects") + "/" + key
 	if strings.HasSuffix(key, "/") {
-		u.Path += "/"
+		u.Path = strings.TrimSuffix(u.Path, "/") + "/"
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), body)
@@ -351,7 +352,7 @@ func (d *dragonfly) Put(ctx context.Context, key string, data io.Reader, getters
 	req.Header.Add(headers.ContentType, writer.FormDataContentType())
 
 	// Put object.
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := d.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -382,7 +383,7 @@ func (d *dragonfly) Copy(ctx context.Context, dst, src string) error {
 		return err
 	}
 
-	u.Path = path.Join("buckets", d.bucket, "objects", dst)
+	u.Path = path.Join("buckets", d.bucket, "objects") + "/" + dst
 	query := u.Query()
 	u.RawQuery = query.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), body)
@@ -394,7 +395,7 @@ func (d *dragonfly) Copy(ctx context.Context, dst, src string) error {
 	req.Header.Add(HeaderDragonflyObjectOperation, fmt.Sprint(CopyOperation))
 
 	// copy object.
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := d.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -415,9 +416,9 @@ func (d *dragonfly) Delete(ctx context.Context, key string, getters ...AttrGette
 		return err
 	}
 
-	u.Path = path.Join("buckets", d.bucket, "objects", key)
+	u.Path = path.Join("buckets", d.bucket, "objects") + "/" + key
 	if strings.HasSuffix(key, "/") {
-		u.Path += "/"
+		u.Path = strings.TrimSuffix(u.Path, "/") + "/"
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u.String(), nil)
@@ -426,7 +427,7 @@ func (d *dragonfly) Delete(ctx context.Context, key string, getters ...AttrGette
 	}
 
 	// Delete object.
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := d.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -580,7 +581,7 @@ func newDragonfly(endpoint, accessKey, secretKey, token string) (ObjectStorage, 
 func getObjectStorageMetadata(endpoint string) (*ObjectStorageMetadata, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("invalid dragonfly endpoint %s: %w", endpoint, err)
 	}
 
 	u.Path = path.Join("metadata")
@@ -590,7 +591,7 @@ func getObjectStorageMetadata(endpoint string) (*ObjectStorageMetadata, error) {
 	}
 
 	// Get object storage Metadata.
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

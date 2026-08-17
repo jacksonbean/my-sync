@@ -30,8 +30,11 @@ func firstGate(obj object.Object, record *sync_db.SyncRecordV2, forceUpdate bool
 		return sync_db.GateNeedSecondGate
 	}
 
-	// 源 mtime 未变 → 直接跳过（核心优化点：这里不调用目标端 Head）
-	if !obj.Mtime().After(record.SourceMtime) {
+	// 源 mtime 未变 → 直接跳过（核心优化点：这里不调用目标端 Head）。
+	// source_mtime 列是 DATETIME（为兼容老 MySQL 去掉毫秒），因此比较时必须
+	// 把对象 mtime 截断到秒，否则亚秒级 mtime（如本地文件系统）永远判为
+	// "变新"，第一层门卫永远无法命中，每次运行都退化为全量第二层 Head。
+	if !obj.Mtime().Truncate(time.Second).After(record.SourceMtime.Truncate(time.Second)) {
 		logger.Debugf("firstGate: %s mtime unchanged (%s), skip", obj.Key(), record.SourceMtime.Format(time.RFC3339))
 		return sync_db.GateSkip
 	}

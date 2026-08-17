@@ -231,6 +231,10 @@ func (h *hdfsclient) List(ctx context.Context, prefix, marker, token, delimiter 
 	}
 
 	file, err := h.c.Open(dir)
+	if file != nil {
+		// Readdir 持有 datanode 连接，Close 才会释放；不关闭会每次 List 泄漏一个连接
+		defer file.Close()
+	}
 	var entries []os.FileInfo
 	if file != nil {
 		entries, err = file.Readdir(0)

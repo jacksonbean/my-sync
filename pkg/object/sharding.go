@@ -144,11 +144,16 @@ func ListAll(ctx context.Context, store ObjectStorage, prefix, marker string, fo
 			logger.Debugf("Continue listing objects from %s marker %q", store, marker)
 			var nextToken2 string
 			objs, hasMore, nextToken2, err = store.List(ctx, prefix, marker, nextToken, "", maxResults, followLink)
-			for err != nil {
+			for i := 0; err != nil; i++ {
+				if i >= 10 {
+					logger.Errorf("Fail to list: %s, give up after %d retries", err.Error(), i)
+					out <- nil
+					return
+				}
 				logger.Warnf("Fail to list: %s, retry again", err.Error())
 				// slow down
 				time.Sleep(time.Millisecond * 100)
-				objs, hasMore, nextToken, err = store.List(ctx, prefix, marker, nextToken, "", maxResults, followLink)
+				objs, hasMore, nextToken2, err = store.List(ctx, prefix, marker, nextToken, "", maxResults, followLink)
 			}
 			nextToken = nextToken2
 			logger.Debugf("Found %d object from %s in %s", len(objs), store, time.Since(startTime))

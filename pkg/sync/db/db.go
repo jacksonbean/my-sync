@@ -272,12 +272,17 @@ func sendSafe(ch chan ObjectRecord, rec ObjectRecord) (sent bool) {
 }
 
 // RecordObject sends an object record to the async channel (non-blocking).
-// Returns an error if the record was dropped due to a full channel.
+// Returns an error if the record was dropped due to a full channel, or if
+// the service was already closed (the record would never be consumed).
+// closed 检查与发送在同一把锁内完成，避免 Close 返回后记录被静默丢弃。
 func (a *AsyncDbService) RecordObject(rec ObjectRecord) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return fmt.Errorf("record dropped (db service closed): %s", rec.SourceKey)
+	}
 	if !sendSafe(a.ch, rec) {
-		a.mu.Lock()
 		a.errors = append(a.errors, fmt.Errorf("RecordObject dropped: %s", rec.SourceKey))
-		a.mu.Unlock()
 		return fmt.Errorf("record dropped (channel full): %s", rec.SourceKey)
 	}
 	return nil
@@ -312,4 +317,19 @@ func (a *AsyncDbService) Errors() []error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.errors
+}
+
+// jobProgressUpdater 是支持"运行中原位更新计数"的底层实现接口。
+type jobProgressUpdater interface {
+	UpdateJobProgress(jobID string, job JobInfo) error
+}
+
+// UpdateJobProgress updates only the counters of a running job.
+// 支持原位更新的实现（mysqlService）只改计数、不动 status/end_time；
+// 其它实现（如测试 mock）没有该能力时静默跳过，避免误写 end_time。
+func (a *AsyncDbService) UpdateJobProgress(jobID string, job JobInfo) error {
+	if u, ok := a.DbService.(jobProgressUpdater); ok {
+		return u.UpdateJobProgress(jobID, job)
+	}
+	return nil
 }
