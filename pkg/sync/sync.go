@@ -204,6 +204,7 @@ var crcTable = crc32.MakeTable(crc32.Castagnoli)
 var logger = utils.GetLogger("juicefs")
 var ctx = context.Background()
 var preserveMeta bool
+var transformMeta bool
 var syncDbService *sync_db.AsyncDbService
 var syncDbJobID string
 
@@ -801,10 +802,31 @@ func getSrcMeta(src object.ObjectStorage, key string) (object.ObjectMeta, bool) 
 	if err != nil {
 		return object.ObjectMeta{}, false
 	}
+	metadata := srcObj.Metadata()
+	if transformMeta {
+		metadata = transformMetadata(metadata, srcObj.Mtime())
+	}
 	return object.ObjectMeta{
 		ContentType: srcObj.ContentType(),
-		Metadata:    srcObj.Metadata(),
+		Metadata:    metadata,
 	}, true
+}
+
+// transformMetadata renames the ecs_meta_version key to ecs-meta-version and
+// appends last-modify-time formatted from the source object's mtime.
+func transformMetadata(meta map[string]string, mtime time.Time) map[string]string {
+	if meta == nil {
+		meta = make(map[string]string, 1)
+	}
+	for k, v := range meta {
+		// S3 and other backends may return canonicalized headers (e.g. Ecs_meta_version), so match case-insensitively
+		if strings.EqualFold(k, "ecs_meta_version") {
+			delete(meta, k)
+			meta["ecs-meta-version"] = v
+		}
+	}
+	meta["last-modify-time"] = mtime.Format("2006-01-02 15:04:05")
+	return meta
 }
 
 // parseDbRecordStatus 将 CLI 传入的状态字符串解析为 ObjectStatus 集合。
@@ -2634,6 +2656,7 @@ func scanOnly(src, dst object.ObjectStorage) error {
 // Sync syncs all the keys between to object storage
 func Sync(src, dst object.ObjectStorage, config *Config) error {
 	preserveMeta = config.PreserveMeta
+	transformMeta = config.TransformMeta
 	scannedKeys = sync.Map{}
 	atomic.StoreInt64(&scannedKeysCount, 0)
 

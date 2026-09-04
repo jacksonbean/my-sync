@@ -1185,3 +1185,41 @@ func TestScanSingleFullKey(t *testing.T) {
 		}
 	}
 }
+
+func TestTransformMetadata(t *testing.T) {
+	mtime := time.Date(2023, 3, 3, 2, 28, 56, 0, time.UTC)
+	expectedTime := "2023-03-03 02:28:56"
+
+	// rename ecs_meta_version to ecs-meta-version, keep value, drop original key
+	meta := transformMetadata(map[string]string{
+		"ecs_meta_version": "v1.2.3",
+		"other-key":        "other-value",
+	}, mtime)
+	if _, ok := meta["ecs_meta_version"]; ok {
+		t.Fatalf("ecs_meta_version should be removed, got %v", meta)
+	}
+	if meta["ecs-meta-version"] != "v1.2.3" {
+		t.Fatalf("ecs-meta-version should be v1.2.3, got %q", meta["ecs-meta-version"])
+	}
+	if meta["other-key"] != "other-value" {
+		t.Fatalf("other-key should be unchanged, got %q", meta["other-key"])
+	}
+	if meta["last-modify-time"] != expectedTime {
+		t.Fatalf("last-modify-time should be %q, got %q", expectedTime, meta["last-modify-time"])
+	}
+
+	// canonicalized header (e.g. from S3) should also match
+	meta = transformMetadata(map[string]string{"Ecs_Meta_Version": "v2"}, mtime)
+	if _, ok := meta["Ecs_Meta_Version"]; ok {
+		t.Fatalf("Ecs_Meta_Version should be removed, got %v", meta)
+	}
+	if meta["ecs-meta-version"] != "v2" {
+		t.Fatalf("ecs-meta-version should be v2, got %q", meta["ecs-meta-version"])
+	}
+
+	// nil metadata should still produce last-modify-time
+	meta = transformMetadata(nil, mtime)
+	if len(meta) != 1 || meta["last-modify-time"] != expectedTime {
+		t.Fatalf("expected only last-modify-time=%q, got %v", expectedTime, meta)
+	}
+}

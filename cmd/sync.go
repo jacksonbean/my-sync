@@ -198,6 +198,10 @@ func syncActionFlags() []cli.Flag {
 			Name:  "preserve-meta",
 			Usage: "preserve content-type and user-defined metadata (e.g. x-amz-meta-* headers) from source objects",
 		},
+		&cli.BoolFlag{
+			Name:  "transform-meta",
+			Usage: "transform user-defined metadata when migrating (with --preserve-meta): rename key ecs_meta_version to ecs-meta-version, and add last-modify-time from source LastModified (format: 2006-01-02 15:04:05)",
+		},
 		&cli.StringFlag{
 			Name:  "db",
 			Usage: "record sync results to MySQL database (e.g. mysql://user:pass@host:3306/dbname)",

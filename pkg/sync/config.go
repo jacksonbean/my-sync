@@ -81,6 +81,7 @@ type Config struct {
 	CheckpointForceReset bool
 	CheckpointFile       string
 	PreserveMeta         bool
+	TransformMeta        bool
 	DbDSN                string
 	GateTable            string
 	Scan                 bool
@@ -242,6 +243,7 @@ func NewConfigFromCli(c *cli.Context) *Config {
 		CheckpointForceReset: c.Bool("checkpoint-force-reset"),
 		CheckpointFile:       c.String("checkpoint-file"),
 		PreserveMeta:         c.Bool("preserve-meta"),
+		TransformMeta:        c.Bool("transform-meta"),
 		DbDSN:                c.String("db"),
 		GateTable:            c.String("gate-table"),
 		Scan:                 c.Bool("scan"),
