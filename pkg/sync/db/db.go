@@ -61,6 +61,8 @@ type ObjectRecord struct {
 	StorageClass string // single-scan: source storage class
 	Status       ObjectStatus
 	ErrorMsg     string
+	SourceMtime  time.Time // scan: source LastModified (from List, no extra Head)
+	TargetMtime  time.Time // scan: destination LastModified (from List, no extra Head)
 	StartTime    time.Time
 	EndTime      time.Time
 }

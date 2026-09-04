@@ -2406,6 +2406,14 @@ func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, pr
 
 // scanSingle lists a single bucket and records object metadata via ListObjects (no Head calls).
 // config.FullKey 为 true 时记录完整 key（含 URL 前缀），否则记录相对前缀的 key。
+// formatMtime formats mtime for CSV output; zero time yields an empty string.
+func formatMtime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format("2006-01-02 15:04:05")
+}
+
 func scanSingle(src object.ObjectStorage, config *Config) error {
 	srcObjects, err := listAll(src, "", "", "", true, true)
 	if err != nil {
@@ -2420,7 +2428,7 @@ func scanSingle(src object.ObjectStorage, config *Config) error {
 	}
 
 	if outputCSV != nil {
-		outputCSV.Write([]string{"source_key", "size", "storage_class"})
+		outputCSV.Write([]string{"source_key", "size", "storage_class", "source_mtime"})
 	}
 
 	for obj := range srcObjects {
@@ -2437,10 +2445,11 @@ func scanSingle(src object.ObjectStorage, config *Config) error {
 				SourceKey:    key,
 				Size:         obj.Size(),
 				StorageClass: obj.StorageClass(),
+				SourceMtime:  obj.Mtime(),
 			})
 		}
 		if outputCSV != nil {
-			outputCSV.Write([]string{key, fmt.Sprintf("%d", obj.Size()), obj.StorageClass()})
+			outputCSV.Write([]string{key, fmt.Sprintf("%d", obj.Size()), obj.StorageClass(), formatMtime(obj.Mtime())})
 		}
 
 		if total%10000 == 0 {
@@ -2473,11 +2482,11 @@ func scanOnlyCSV(src, dst object.ObjectStorage) error {
 	if err != nil {
 		return fmt.Errorf("list destination: %w", err)
 	}
-	outputCSV.Write([]string{"source_key", "size", "status"})
+	outputCSV.Write([]string{"source_key", "size", "source_mtime", "target_mtime", "status"})
 
 	var total int64
-	write := func(key string, size int64, status sync_db.ObjectStatus) {
-		outputCSV.Write([]string{key, fmt.Sprintf("%d", size), string(status)})
+	write := func(key string, size int64, status sync_db.ObjectStatus, srcMtime, dstMtime time.Time) {
+		outputCSV.Write([]string{key, fmt.Sprintf("%d", size), formatMtime(srcMtime), formatMtime(dstMtime), string(status)})
 	}
 
 	var scanErr error
@@ -2501,25 +2510,25 @@ func scanOnlyCSV(src, dst object.ObjectStorage) error {
 		}
 		switch {
 		case !srcOK:
-			write(dstObj.Key(), dstObj.Size(), sync_db.StatusExtra)
+			write(dstObj.Key(), dstObj.Size(), sync_db.StatusExtra, time.Time{}, dstObj.Mtime())
 			dstObj, dstOK = pull(dstObjects, "destination")
 		case !dstOK:
 			total++
-			write(srcObj.Key(), srcObj.Size(), sync_db.StatusMissing)
+			write(srcObj.Key(), srcObj.Size(), sync_db.StatusMissing, srcObj.Mtime(), time.Time{})
 			srcObj, srcOK = pull(srcObjects, "source")
 		case srcObj.Key() < dstObj.Key():
 			total++
-			write(srcObj.Key(), srcObj.Size(), sync_db.StatusMissing)
+			write(srcObj.Key(), srcObj.Size(), sync_db.StatusMissing, srcObj.Mtime(), time.Time{})
 			srcObj, srcOK = pull(srcObjects, "source")
 		case srcObj.Key() > dstObj.Key():
-			write(dstObj.Key(), dstObj.Size(), sync_db.StatusExtra)
+			write(dstObj.Key(), dstObj.Size(), sync_db.StatusExtra, time.Time{}, dstObj.Mtime())
 			dstObj, dstOK = pull(dstObjects, "destination")
 		default:
 			total++
 			if srcObj.Size() == dstObj.Size() {
-				write(srcObj.Key(), srcObj.Size(), sync_db.StatusMatches)
+				write(srcObj.Key(), srcObj.Size(), sync_db.StatusMatches, srcObj.Mtime(), dstObj.Mtime())
 			} else {
-				write(srcObj.Key(), srcObj.Size(), sync_db.StatusDiffers)
+				write(srcObj.Key(), srcObj.Size(), sync_db.StatusDiffers, srcObj.Mtime(), dstObj.Mtime())
 			}
 			srcObj, srcOK = pull(srcObjects, "source")
 			dstObj, dstOK = pull(dstObjects, "destination")
@@ -2549,16 +2558,18 @@ func scanOnly(src, dst object.ObjectStorage) error {
 	startTime := time.Now()
 
 	if outputCSV != nil {
-		outputCSV.Write([]string{"source_key", "size", "content_type", "status"})
+		outputCSV.Write([]string{"source_key", "size", "content_type", "source_mtime", "target_mtime", "status"})
 	}
 
-	record := func(key string, size int64, status sync_db.ObjectStatus, isExtra bool) {
+	record := func(key string, size int64, status sync_db.ObjectStatus, isExtra bool, srcMtime, dstMtime time.Time) {
 		rec := sync_db.ObjectRecord{
-			JobID:     syncDbJobID,
-			Size:      size,
-			Status:    status,
-			StartTime: startTime,
-			EndTime:   time.Now(),
+			JobID:       syncDbJobID,
+			Size:        size,
+			Status:      status,
+			SourceMtime: srcMtime,
+			TargetMtime: dstMtime,
+			StartTime:   startTime,
+			EndTime:     time.Now(),
 		}
 		if isExtra {
 			rec.TargetKey = key
@@ -2570,7 +2581,7 @@ func scanOnly(src, dst object.ObjectStorage) error {
 			_ = syncDbService.RecordObject(rec)
 		}
 		if outputCSV != nil {
-			outputCSV.Write([]string{key, fmt.Sprintf("%d", size), "", string(status)})
+			outputCSV.Write([]string{key, fmt.Sprintf("%d", size), "", formatMtime(srcMtime), formatMtime(dstMtime), string(status)})
 		}
 	}
 
@@ -2598,30 +2609,30 @@ func scanOnly(src, dst object.ObjectStorage) error {
 		switch {
 		case !srcOK:
 			extras++
-			record(dstObj.Key(), dstObj.Size(), sync_db.StatusExtra, true)
+			record(dstObj.Key(), dstObj.Size(), sync_db.StatusExtra, true, time.Time{}, dstObj.Mtime())
 			dstObj, dstOK = pull(dstObjects, "destination")
 		case !dstOK:
 			total++
 			missing++
-			record(srcObj.Key(), srcObj.Size(), sync_db.StatusMissing, false)
+			record(srcObj.Key(), srcObj.Size(), sync_db.StatusMissing, false, srcObj.Mtime(), time.Time{})
 			srcObj, srcOK = pull(srcObjects, "source")
 		case srcObj.Key() < dstObj.Key():
 			total++
 			missing++
-			record(srcObj.Key(), srcObj.Size(), sync_db.StatusMissing, false)
+			record(srcObj.Key(), srcObj.Size(), sync_db.StatusMissing, false, srcObj.Mtime(), time.Time{})
 			srcObj, srcOK = pull(srcObjects, "source")
 		case srcObj.Key() > dstObj.Key():
 			extras++
-			record(dstObj.Key(), dstObj.Size(), sync_db.StatusExtra, true)
+			record(dstObj.Key(), dstObj.Size(), sync_db.StatusExtra, true, time.Time{}, dstObj.Mtime())
 			dstObj, dstOK = pull(dstObjects, "destination")
 		default:
 			total++
 			if srcObj.Size() == dstObj.Size() {
 				matches++
-				record(srcObj.Key(), srcObj.Size(), sync_db.StatusMatches, false)
+				record(srcObj.Key(), srcObj.Size(), sync_db.StatusMatches, false, srcObj.Mtime(), dstObj.Mtime())
 			} else {
 				differs++
-				record(srcObj.Key(), srcObj.Size(), sync_db.StatusDiffers, false)
+				record(srcObj.Key(), srcObj.Size(), sync_db.StatusDiffers, false, srcObj.Mtime(), dstObj.Mtime())
 			}
 			srcObj, srcOK = pull(srcObjects, "source")
 			dstObj, dstOK = pull(dstObjects, "destination")

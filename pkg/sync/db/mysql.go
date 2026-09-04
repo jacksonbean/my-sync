@@ -110,6 +110,14 @@ func (s *mysqlService) createJobsTable() error {
 	return err
 }
 
+// nilIfZeroTime returns nil for zero time so MySQL stores NULL instead of '0001-01-01'.
+func nilIfZeroTime(t time.Time) interface{} {
+	if t.IsZero() {
+		return nil
+	}
+	return t
+}
+
 func (s *mysqlService) createSingleScanTable(tableName string) error {
 	tableName = strings.ReplaceAll(tableName, "-", "_")
 	tableName = strings.ReplaceAll(tableName, ".", "_")
@@ -117,7 +125,8 @@ func (s *mysqlService) createSingleScanTable(tableName string) error {
 		id BIGINT AUTO_INCREMENT PRIMARY KEY,
 		source_key VARCHAR(2048) NOT NULL,
 		size BIGINT DEFAULT 0,
-		storage_class VARCHAR(64)
+		storage_class VARCHAR(64),
+		source_mtime DATETIME
 	) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4`, s.dataDB(), tableName)
 	_, err := s.db.Exec(sql)
 	if err != nil {
@@ -137,6 +146,8 @@ func (s *mysqlService) createObjectsTable(tableName string) error {
 		storage_class VARCHAR(64),
 		status VARCHAR(16) NOT NULL,
 		error_msg TEXT,
+		source_mtime DATETIME,
+		target_mtime DATETIME,
 		start_time DATETIME,
 		end_time DATETIME,
 		INDEX idx_status (status)
@@ -216,22 +227,23 @@ func (s *mysqlService) RecordObject(rec ObjectRecord) error {
 		return fmt.Errorf("no active job")
 	}
 
-	// Single scan: simplified schema (key, size, storage_class)
+	// Single scan: simplified schema (key, size, storage_class, source_mtime)
 	if s.isSingleScan {
 		objectsSQL := fmt.Sprintf(`INSERT INTO `+"`%s`"+`.`+"`%s`"+`
-			(source_key, size, storage_class)
-			VALUES (?, ?, ?)`, s.dataDB(), table)
+			(source_key, size, storage_class, source_mtime)
+			VALUES (?, ?, ?, ?)`, s.dataDB(), table)
 		_, err := s.db.Exec(objectsSQL,
-			rec.SourceKey, rec.Size, rec.StorageClass)
+			rec.SourceKey, rec.Size, rec.StorageClass, nilIfZeroTime(rec.SourceMtime))
 		return err
 	}
 
 	objectsSQL := fmt.Sprintf(`INSERT INTO `+"`%s`"+`.`+"`%s`"+`
-		(source_key, target_key, size, storage_class, status, error_msg, start_time, end_time)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, s.dataDB(), table)
+		(source_key, target_key, size, storage_class, status, error_msg, source_mtime, target_mtime, start_time, end_time)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.dataDB(), table)
 	_, err := s.db.Exec(objectsSQL,
 		rec.SourceKey, rec.TargetKey, rec.Size,
 		rec.StorageClass, string(rec.Status), rec.ErrorMsg,
+		nilIfZeroTime(rec.SourceMtime), nilIfZeroTime(rec.TargetMtime),
 		rec.StartTime, rec.EndTime)
 	return err
 }
@@ -277,14 +289,14 @@ func (s *mysqlService) recordObjectsSingleScan(recs []ObjectRecord, table string
 		batch := recs[i:end]
 
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("INSERT INTO `%s`.`%s` (source_key, size, storage_class) VALUES ", s.dataDB(), table))
-		args := make([]interface{}, 0, len(batch)*3)
+		sb.WriteString(fmt.Sprintf("INSERT INTO `%s`.`%s` (source_key, size, storage_class, source_mtime) VALUES ", s.dataDB(), table))
+		args := make([]interface{}, 0, len(batch)*4)
 		for j, rec := range batch {
 			if j > 0 {
 				sb.WriteString(",")
 			}
-			sb.WriteString("(?, ?, ?)")
-			args = append(args, rec.SourceKey, rec.Size, rec.StorageClass)
+			sb.WriteString("(?, ?, ?, ?)")
+			args = append(args, rec.SourceKey, rec.Size, rec.StorageClass, nilIfZeroTime(rec.SourceMtime))
 		}
 		if _, err := tx.Exec(sb.String(), args...); err != nil {
 			return fmt.Errorf("batch insert single scan: %w", err)
@@ -319,15 +331,16 @@ func (s *mysqlService) recordObjectsSync(recs []ObjectRecord, table string) erro
 		batch := recs[i:end]
 
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("INSERT INTO `%s`.`%s` (source_key, target_key, size, storage_class, status, error_msg, start_time, end_time) VALUES ", s.dataDB(), table))
-		args := make([]interface{}, 0, len(batch)*8)
+		sb.WriteString(fmt.Sprintf("INSERT INTO `%s`.`%s` (source_key, target_key, size, storage_class, status, error_msg, source_mtime, target_mtime, start_time, end_time) VALUES ", s.dataDB(), table))
+		args := make([]interface{}, 0, len(batch)*10)
 		for j, rec := range batch {
 			if j > 0 {
 				sb.WriteString(",")
 			}
-			sb.WriteString("(?, ?, ?, ?, ?, ?, ?, ?)")
+			sb.WriteString("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 			args = append(args, rec.SourceKey, rec.TargetKey, rec.Size,
 				rec.StorageClass, string(rec.Status), rec.ErrorMsg,
+				nilIfZeroTime(rec.SourceMtime), nilIfZeroTime(rec.TargetMtime),
 				rec.StartTime, rec.EndTime)
 		}
 		if _, err := tx.Exec(sb.String(), args...); err != nil {
