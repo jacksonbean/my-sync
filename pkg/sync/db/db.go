@@ -25,6 +25,7 @@ const (
 	StatusDiffers ObjectStatus = "differs" // scan: size differs
 	StatusMatches ObjectStatus = "matches" // scan: identical on both sides
 	StatusExtra   ObjectStatus = "extra"   // scan: on destination but not source
+	StatusLost    ObjectStatus = "lost"    // sync: scanned but not handled when run ended (e.g. --max-failure abort)
 )
 
 // JobStatus is the overall sync job status.

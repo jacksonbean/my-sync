@@ -1692,17 +1692,6 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 	}
 
 	var dstobj object.Object
-	var (
-		skip, skipBytes int64
-		lastUpdate      time.Time
-	)
-	flushProgress := func() {
-		skipped.IncrInt64(skip)
-		skippedBytes.IncrInt64(skipBytes)
-		incrHandled(int(skip))
-		skip, skipBytes = 0, 0
-	}
-	defer flushProgress()
 
 	defer func() {
 		if checkpointMgr != nil && retErr == nil {
@@ -1715,14 +1704,13 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 		if checkpointMgr != nil {
 			checkpointMgr.UpdateLastListedKey(prefix, obj)
 		}
-		skip++
-		skipBytes += obj.Size()
+		// 立即更新计数器，不能攒批刷新：--max-failure 中止路径走 os.Exit，
+		// defer 的批量刷新不会执行，会把未刷新的 skip 误报成 lost。
+		skipped.Increment()
+		skippedBytes.IncrInt64(obj.Size())
+		incrHandled(1)
 		if syncDbService != nil {
 			recordSyncObject(syncDbJobID, obj.Key(), obj.Size(), time.Now(), sync_db.StatusSkipped, "")
-		}
-		if skip > 100 || time.Since(lastUpdate) > time.Millisecond*100 {
-			lastUpdate = time.Now()
-			flushProgress()
 		}
 	}
 
@@ -3079,6 +3067,25 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 					logger.Warnf("Lost objects (%d total, %d tracked%s): %v", lost, len(lostKeys), note, lostKeys)
 				} else {
 					logger.Warnf("Lost objects (%d total, none tracked%s)", lost, note)
+				}
+				// lost 对象始终落库（不受 --db-record-status 白名单限制），便于排查中止时未处理的对象；
+				// 必须在 syncDbService.Close() 之前写入，保证异步队列能刷进库。
+				if syncDbService != nil && len(lostKeys) > 0 {
+					now := time.Now()
+					recs := make([]sync_db.ObjectRecord, 0, len(lostKeys))
+					for _, k := range lostKeys {
+						recs = append(recs, sync_db.ObjectRecord{
+							JobID:     syncDbJobID,
+							SourceKey: k,
+							TargetKey: k,
+							Status:    sync_db.StatusLost,
+							StartTime: now, // start_time/end_time 列不允许零值时间，直接写记录时刻
+							EndTime:   now,
+						})
+					}
+					if err := syncDbService.RecordObjects(recs); err != nil {
+						logger.Warnf("Failed to record %d lost objects to db: %v", len(recs), err)
+					}
 				}
 			}
 
